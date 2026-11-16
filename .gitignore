@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+*.out
+*.err
+*.log
+# Simulation and post-processing outputs: refine these rules once formats are known.
+*.TSHS
+*.TSDE
+*.TBT.nc
+*.nc
+*.npz
+*.ipynb_checkpoints
+*.ipynb
+*.sh
+Examples
+RKKY_calc_2B.py
+RKKY_calc_Hadatom.py
