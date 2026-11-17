@@ -256,7 +256,7 @@ def _warn(msgs, verbose: bool) -> None:
     for m in msgs:
         if verbose:
             print("WARNING: " + m, flush=True)
-        warnings.warn(m)
+        #warnings.warn(m)
 
 
 def _fmt(e: dict) -> str:
@@ -276,9 +276,6 @@ def _report_defect_electrodes(entries, tails: dict, tol: float, overlap_tol: flo
     """
     if verbose:
         _section("Electrode regions (single-defect Hamiltonians)")
-        print("(the electrode cells of the device are pristine; checked is each single-defect")
-        print(" Hamiltonian after its energy alignment: the part placed in the electrode cells,")
-        print(" if any, and the end cells of its supercell next to the electrodes)")
         for k, (label, reg) in enumerate(entries):
             print(f"Defect {'ij'[k]} ({label})")
             for side in ("left", "right"):

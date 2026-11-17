@@ -63,6 +63,7 @@ import J_dependencies as JD
 from defects_dependencies import auto_spec, load_defects
 from Device_Builder import PristineTiled, DFTDevice, build_on_root, canonical_method
 from Dyson_Exchange import SuperpositionDyson, calculate_exchange_dyson
+from exchange_static_cache import cache_exchange_static
 
 __all__ = ["run_exchange", "ExchangeRun", "load_inputs", "load_results", "METHODS",
            "DEFAULT_PREFACTOR"]
@@ -70,13 +71,10 @@ __all__ = ["run_exchange", "ExchangeRun", "load_inputs", "load_results", "METHOD
 METHODS = {"rkky": "PristineTiled", "rkky_sup": "SuperpositionDyson",
            "liechtenstein_sup": "SuperpositionDyson", "rkky_nm": "DFTDevice",
            "liechtenstein": "DFTDevice"}
-# Conventions of the tutorials: -1/pi for the rkky methods built from single-defect
-# files, -1/(4 pi) as in Liecht_calc_Hadatom.py for the Liechtenstein methods and for
-# rkky_nm (so that rkky_nm and liechtenstein can be compared). Pass prefactor=... to
-# use one convention for everything.
+# use one convention for everything. Here ....
 DEFAULT_PREFACTOR = {"rkky": -1.0 / np.pi, "rkky_sup": -1.0 / np.pi,
-                     "rkky_nm": -1.0 / (4.0 * np.pi), "liechtenstein": -1.0 / (4.0 * np.pi),
-                     "liechtenstein_sup": -1.0 / (4.0 * np.pi)}
+                     "rkky_nm": -1.0 / np.pi, "liechtenstein": -1.0 /  np.pi,
+                     "liechtenstein_sup": -1.0 / np.pi }
 _DEFAULT_REGION = {"rkky": "all", "rkky_sup": "all", "liechtenstein_sup": "all",
                    "rkky_nm": "radius", "liechtenstein": "radius"}
 
@@ -190,7 +188,9 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                  align: str = "vb", nk=(1, 0, 0), lead_eta: float = 1e-5,
                  self_energy_mode: str = "compute", orbital_resolved: bool = True,
                  write_results: bool = True, verbose: bool = True,
-                 builder_kwargs: Optional[dict] = None, comm=None) -> Optional[ExchangeRun]:
+                 builder_kwargs: Optional[dict] = None, comm=None,
+                 cache_static: bool = True,
+                 save_deltas: bool = True) -> Optional[ExchangeRun]:
     """Compute J for one defect pair with any implemented method.
 
     method          : 'rkky', 'rkky_sup', 'liechtenstein_sup' ('lkag_sup'),
@@ -216,6 +216,10 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     align           : band alignment of the pruned pristine Hamiltonian (prune_ham)
     self_energy_mode: 'compute' (default); 'compute+write' / 'read' cache the lead
                       self-energies in folder/Self_Energies (calculate_exchange only)
+    save_deltas     : if False, cache H blocks and Dyson reference only.
+    cache_static    : save/read static Delta and H-downfolding blocks in
+                      folder/results_name/Static, independently of lead caching.
+                      Validates against current builder data each run.
     builder_kwargs  : extra keyword arguments for the builder (e.g. tol, embed_radius)
     comm            : MPI communicator (e.g. MPI.COMM_WORLD) to share the contour
                       energies between ranks; rank 0 returns the ExchangeRun, the
@@ -321,6 +325,42 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     results_name = results_name or _default_results_name(
         method, defect_i, defect_j, n_dist, downfold, region, radius, vertices, vertex_source)
     results_dir = folder / results_name
+    # BEGIN RESTART-SAFE CACHE V2
+    # BEGIN EXCHANGE STATIC CACHE
+    if cache_static:
+        cache_args = dict(
+            basis=basis, defect_i=defect_i, defect_j=defect_j,
+            n_dist=n_dist, downfold=downfold, region=region, radius=radius,
+            vertices=vertices, N_imp=N_imp, N_buffer=N_buffer,
+            axis=(builder_kwargs or {}).get("axis", 0),
+            save_deltas=save_deltas,
+        )
+        cache_error = None
+        if rank == 0:
+            try:
+                cache_path = cache_exchange_static(
+                    obj, method, folder, results_name, mode="auto", **cache_args)
+                say(f"Static vertices / H blocks: {cache_path}")
+            except Exception:
+                cache_error = traceback.format_exc()
+        if parallel:
+            cache_error = comm.bcast(cache_error, root=0)
+        if cache_error:
+            raise RuntimeError("Static exchange cache failed on rank 0:\n" + cache_error)
+        if parallel:
+            # Every rank must use the loaded static data; rank 0 alone writes.
+            local_error = None
+            if rank != 0:
+                try:
+                    cache_exchange_static(
+                        obj, method, folder, results_name, mode="read", **cache_args)
+                except Exception:
+                    local_error = traceback.format_exc()
+            errors = comm.allgather(local_error)
+            if any(error is not None for error in errors):
+                raise RuntimeError("Static exchange cache read failed:\n" +
+                                   "\n".join(e for e in errors if e is not None))
+    # END EXCHANGE STATIC CACHE
     if rank == 0:
         folder.mkdir(parents=True, exist_ok=True)
     if parallel:
@@ -356,7 +396,7 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                   radius=radius, vertices=vertices, vertex_source=vertex_source,
                   vertex_downfold=vertex_downfold, prefactor=prefactor, align=align,
                   N_imp=N_imp, N_buffer=N_buffer, nk=list(nk), lead_eta=lead_eta,
-                  self_energy_mode=self_energy_mode, contour=contour["source"],
+                  self_energy_mode=self_energy_mode, cache_static=bool(cache_static), contour=contour["source"],
                   mpi_ranks=comm.Get_size() if parallel else 1,
                   pristine_file=str(data["PRISTINE_FILE"]),
                   defect_files={k: (files[k] if isinstance(files[k], dict) else str(files[k]))

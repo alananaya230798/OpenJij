@@ -1,5 +1,7 @@
 """Minimal disk/MPI helpers for J_dependencies.py.
 
+# BEGIN RESTART-SAFE CACHE V2
+
 TBTGF uses bulk B(z)=z*S-H-Sigma, not the raw self-energy Sigma.
 This module writes both spin channels, regardless of which one exchange uses.
 """
@@ -216,10 +218,8 @@ def write_electrode_tbtgf(folder, H_device, HamL, semi_L, HamR, semi_R,
         try:
             folder.mkdir(parents=True, exist_ok=True)
             tmp_dir.mkdir(parents=True, exist_ok=True)
-            if manifest.exists():
-                _check_metadata(manifest, meta, allow_electrode_hash_mismatch=True)
-            else:
-                _write_json(manifest, meta)
+            from exchange_cache_policy import prepare_lead_cache
+            prepare_lead_cache(folder, HamL, HamR, meta)
         except Exception as exc:
             setup_error = f'{type(exc).__name__}: {exc}'
     if comm is not None:
@@ -334,8 +334,8 @@ class TBTGFProvider:
                                      left_orbs, right_orbs)
         expected = _tbtgf_metadata(H_device, HamL, HamR, semi_L, semi_R,
                                     E, self.k, k_weights, li, ri, lead_eta, mu)
-        _check_metadata(folder / 'config.json', expected,
-                        allow_electrode_hash_mismatch=True)
+        from exchange_cache_policy import check_lead_cache
+        check_lead_cache(folder, HamL, HamR, expected)
         self.files = [sisl.io.tbtgfSileTBtrans(str(folder / name), 'r')
                       for name in ('Left.TBTGF', 'Right.TBTGF')]
         self.idx = [li, ri]
@@ -400,7 +400,7 @@ def prepare_calculation_folder(folder, H_refs, method, Di, oi, Dj, oj, E, W,
         return
 
     # Create required directories
-    for sub in (folder / 'Deltas', folder / 'Self_Energies',
+    for sub in (folder / 'Self_Energies',
                 results_folder, results_folder / 'tmp'):
         sub.mkdir(parents=True, exist_ok=True)
 
@@ -427,10 +427,8 @@ def prepare_calculation_folder(folder, H_refs, method, Di, oi, Dj, oj, E, W,
     conf_path = results_folder / "config.json"
     contour = results_folder / "contour.npz"
 
-    if conf_path.exists():
-        _check_metadata(conf_path, conf)
-    else:
-        _write_json(conf_path, conf)
+    from exchange_cache_policy import update_result_config
+    update_result_config(conf_path, conf)
 
     if not contour.exists():
         _atomic_npz(contour, energies=E, contour_weights=W)

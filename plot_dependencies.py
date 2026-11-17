@@ -195,23 +195,29 @@ def plot_setup(run: ExchangeRun, ylim=None):
     """Device geometry: anchors, vertex regions, electrodes, adatoms (and region R)."""
     H = run.H
     g = H.geometry
-    fig, ax = JD.plot_atoms(g, annotate=False, size=6)
+    fig, ax = plot_atoms(g, annotate=False, size=12)
     _, orbs = run.vertices()
-    for k, (o, col) in enumerate(zip(orbs, ("tab:red", "tab:blue"))):
-        at = g.o2a(np.asarray(o), unique=True)
-        ax.scatter(g.xyz[at, 0], g.xyz[at, 1], s=30, facecolors="none", edgecolors=col,
-                   label=f"vertex {'ij'[k]}")
-        ax.scatter(*g.xyz[run.obj.anchors[k], :2], s=90, c=col, marker="X")
+    colors = ("red", "blue")
+
+    for i, color in enumerate(colors):
+        anchor = int(run.obj.anchors[i])    
+        ax.scatter(
+            [g.xyz[anchor, 0]],
+            [g.xyz[anchor, 1]],
+            s=150,
+            marker="o",
+            edgecolors=color,facecolors="none",
+            zorder=10,label=fr"Defect {i}")
     if run.config["builder"] == "SuperpositionDyson":
         R_at = g.o2a(run.obj.R, unique=True)
-        ax.scatter(g.xyz[R_at, 0], g.xyz[R_at, 1], s=8, c="0.3", label="region R")
+        ax.scatter(g.xyz[R_at, 0], g.xyz[R_at, 1], s=70, facecolors="none",edgecolors="k", label="region R")
     for orbs_e, col in ((run.obj.left_orbs, "tab:green"), (run.obj.right_orbs, "tab:green")):
         at = g.o2a(np.asarray(orbs_e), unique=True)
-        ax.scatter(g.xyz[at, 0], g.xyz[at, 1], s=12, c=col)
+        ax.scatter(g.xyz[at, 0], g.xyz[at, 1], s=70, c=col,edgecolors='k',linewidths=0.1)
     h = np.flatnonzero(g.atoms.Z == 1)
     h = [a for a in h if min(np.linalg.norm(g.xyz[a] - g.xyz[list(run.obj.anchors)], axis=1)) < 1.6]
-    if h:
-        ax.scatter(g.xyz[h, 0], g.xyz[h, 1], s=60, c="cyan", edgecolors="black", label="adatoms")
+    #if h:
+    #    ax.scatter(g.xyz[h, 0], g.xyz[h, 1], s=60, c="cyan", edgecolors="black", label="adatoms")
     if ylim is not None:
         ax.set_ylim(*ylim)
     ax.legend(fontsize=7)
@@ -227,15 +233,17 @@ def plot_vertices(run: ExchangeRun, ylim=None, vabs: float = 0.5):
     energy-dependent correction inside the exchange calculation.
     """
     H = run.H
+    g = H.geometry
     Ds, orbs = run.vertices()
     figs = []
+    colors = ("red", "blue")
     for k, (D, o) in enumerate(zip(Ds, orbs)):
         color = (JD.get_Delta_orbital_atoms(H, D, "pz", orb_host=np.asarray(o))
-                 + JD.get_Delta_orbital_atoms(H, D, "s", orb_host=np.asarray(o)))
-        fig, ax = JD.plot_atoms(H.geometry, color=color, size=8, vabs=vabs,
+                 + JD.get_Delta_orbital_atoms(H, D, "s", orb_host=np.asarray(o))+ JD.get_Delta_orbital_atoms(H, D, "dz", orb_host=np.asarray(o)))
+        fig, ax = plot_atoms(g, color=color, size=8, vabs=vabs,
                                 label=rf"$\Delta_{'ij'[k]}$ (eV)")
-        ax.scatter(*H.geometry.xyz[run.obj.anchors[0], :2], s=150, c="yellow", marker="x")
-        ax.scatter(*H.geometry.xyz[run.obj.anchors[1], :2], s=150, c="purple", marker="x")
+        for i, color in enumerate(colors):
+          ax.scatter(g.xyz[run.obj.anchors[i], 0],g.xyz[run.obj.anchors[i], 1], s=150, facecolors="none",edgecolors=color)
         if ylim is not None:
             ax.set_ylim(*ylim)
         figs.append(fig)
@@ -263,6 +271,7 @@ def plot_dos(run: ExchangeRun, energies=None, eta: float = 1e-2):
     ax.set_xlabel("Energy [eV]")
     ax.set_ylabel("DOS [states/eV]" + (" of R" if run.config["builder"] == "SuperpositionDyson" else ""))
     ax.set_ylim(0, None)
+    ax.set_xlim(min(energies), max(energies))
     ax.legend(fontsize=7)
     ax.set_title(f"{run.method}: DOS")
     plt.tight_layout()
