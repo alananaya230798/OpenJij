@@ -497,7 +497,7 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
                              results_name: Optional[str] = None, write_results: bool = False,
                              comm=None, vertices: Optional[str] = None,
                              internal_checks: bool = False, solver: str = "sparse",
-                             orbital_kernel: str = "full"):
+                             orbital_kernel: str = "full", self_energy_mode: str = "compute"):
     """J from the Dyson-equation methods. Returns an ExchangeResult (Gamma point).
 
     Same kernel and conventions as calculate_exchange:
@@ -522,6 +522,7 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
     orbital_kernel  : with orbital_resolved: 'full' (orbital-pair kernel per energy,
                       n_i x n_j x nE in memory), 'classes' (per energy, summed over
                       pairs of orbital classes), 'none' (only the integrated J_orb).
+    self_energy_mode : 'compute', 'compute+write', or 'read' for electrode TBTGF I/O.
     """
     import J_dependencies as JD
     method = _method(method, internal_checks=internal_checks)
@@ -541,6 +542,11 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
         raise ValueError("orbital_kernel must be 'full', 'classes' or 'none'")
     rank = comm.Get_rank() if comm is not None else 0
     size = comm.Get_size() if comm is not None else 1
+    self_energy_mode = self_energy_mode.lower().strip()
+    if self_energy_mode not in ("compute", "read", "compute+write"):
+        raise ValueError("self_energy_mode must be compute, read or compute+write")
+    if self_energy_mode != "compute" and calculation_folder is None:
+        raise ValueError("calculation_folder required for TBTGF I/O")
 
     z_array = np.asarray(energies, dtype=complex)
     w_array = np.asarray(contour_weights, dtype=complex)
@@ -550,11 +556,25 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
     R = system.R
     Hm = sparse.csc_matrix(H.Hk(format="csr"), dtype=complex)
     Sm = sparse.csc_matrix(H.Sk(format="csr"), dtype=complex)
-    self_energy = JD.recursive_leads_from_hamiltonians(
-        H_device=H, HamL=system.HamL, semi_L=system.semi_L, HamR=system.HamR,
-        semi_R=system.semi_R, left_orbs=system.left_orbs, right_orbs=system.right_orbs,
-        eta=lead_eta, polarized_leads=False)
     k0 = np.zeros(3)
+    if self_energy_mode == "compute":
+        self_energy = JD.recursive_leads_from_hamiltonians(
+            H_device=H, HamL=system.HamL, semi_L=system.semi_L, HamR=system.HamR,
+            semi_R=system.semi_R, left_orbs=system.left_orbs, right_orbs=system.right_orbs,
+            eta=lead_eta, polarized_leads=False)
+    else:
+        from exchange_mpi_io import TBTGFProvider, write_electrode_tbtgf
+        se_folder = os.path.join(calculation_folder, "Self_Energies")
+        if self_energy_mode == "compute+write":
+            write_electrode_tbtgf(
+                se_folder, H, system.HamL, system.semi_L, system.HamR, system.semi_R,
+                z_array, nk=(1, 0, 0), left_orbs=system.left_orbs,
+                right_orbs=system.right_orbs, lead_eta=lead_eta,
+                mpi=comm is not None and size > 1)
+        self_energy = TBTGFProvider(
+            se_folder, H, system.HamL, system.HamR, system.semi_L, system.semi_R,
+            z_array, k0[None, :], np.ones(1), left_orbs=system.left_orbs,
+            right_orbs=system.right_orbs, lead_eta=lead_eta)
     li, lj = system.loc
     Vi, Vj = R[li], R[lj]                      # vertex orbitals, device indices
     p = complex(prefactor)
@@ -582,10 +602,15 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
             D = D + sparse.coo_matrix((corr.ravel(), (rows.ravel(), cols.ravel())), shape=D.shape)
         return D.tocsr()
 
-    def propagators(z):
+    def lead_terms(z, ie):
+        if self_energy_mode == "compute":
+            return self_energy(z, k0, 0)
+        return self_energy(z, k0, 0, ie=ie, ik=0)
+
+    def propagators(z, ie):
         """(G_ij, G_ji): spin up / down for LKAG, the same G for the rkky methods."""
         if solver == "dyson":
-            sigma_leads = JD._lead_embedding(n, self_energy(z, k0, 0))
+            sigma_leads = JD._lead_embedding(n, lead_terms(z, ie))
             lu = splu((z * Sm - Hm - sigma_leads).tocsc())
             G0 = lu.solve(rhs)[R, :]
             del lu
@@ -597,7 +622,7 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
             else:
                 Gs = tuple(np.linalg.solve(eye - G0 @ _perturbation(system, z, s_), G0) for s_ in (0, 1))
             return Gs[0][np.ix_(li, lj)], Gs[1][np.ix_(lj, li)]
-        A0 = (z * Sm - Hm - JD._lead_embedding(n, self_energy(z, k0, 0))).tocsc()
+        A0 = (z * Sm - Hm - JD._lead_embedding(n, lead_terms(z, ie))).tocsc()
 
         def blocks(spin):
             A = A0 if spin is None else (A0 - sdev.U(z, spin)).tocsc()
@@ -640,7 +665,7 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
 
     for ie in range(rank, len(z_array), size):
         z = z_array[ie]
-        G_ij, G_ji = propagators(z)
+        G_ij, G_ji = propagators(z, ie)
         Di, Dj = vertex(0, z), vertex(1, z)
         x = np.asarray(G_ij @ Dj)              # G_ij Delta_j   (up for LKAG)
         y = np.asarray(G_ji @ Di)              # G_ji Delta_i   (down for LKAG)
@@ -671,7 +696,12 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
             comm.Reduce(cls_k, tot_c, op=MPI.SUM, root=0)
             cls_k = tot_c
         if rank != 0:
+            if self_energy_mode != "compute":
+                self_energy.close()
             return None
+
+    if self_energy_mode != "compute":
+        self_energy.close()
 
     J_k = 1000.0 * np.imag(kernels.sum(axis=1))
     if verbose:

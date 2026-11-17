@@ -223,7 +223,7 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     prefactor       : default from DEFAULT_PREFACTOR
     align           : band alignment of the pruned pristine Hamiltonian (prune_ham)
     self_energy_mode: 'compute' (default); 'compute+write' / 'read' cache the lead
-                      self-energies in folder/Self_Energies (calculate_exchange only)
+                      self-energies in folder/Self_Energies (all exchange methods)
     cache_static    : load-first cache of the built device in folder/results_name/Static:
                       if the build key (settings, input-file fingerprints, builder
                       source) matches, the built device is loaded and no DFT file
@@ -392,7 +392,9 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
             obj, method, contour["En"], contour["weights"], prefactor=prefactor,
             lead_eta=lead_eta, vertex_downfold=vertex_downfold, vertices=vertices,
             orbital_resolved=orbital_resolved, verbose=verbose,
-            comm=comm if parallel else None, solver=solver, orbital_kernel=orbital_kernel)
+            comm=comm if parallel else None, solver=solver, orbital_kernel=orbital_kernel,
+            self_energy_mode=self_energy_mode,
+            calculation_folder=folder if self_energy_mode != "compute" else None)
     else:
         result = JD.calculate_exchange(
             **obj.exchange_kwargs(method), prefactor=prefactor, energies=contour["En"],
