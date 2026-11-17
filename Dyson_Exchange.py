@@ -52,6 +52,17 @@ downfold=True  : the adatom is folded into the carbons it couples to, exactly
                  'linear', exact counterpart of the explicit-H kernel) or
                  Sigma_up - Sigma_dn (vertex_downfold='full').
 
+Solvers
+-------
+solver='sparse' (default): G = (A0 - U(z))^(-1) from one sparse LU of the
+    device per energy and spin, with right-hand sides on the vertex orbitals
+    only. A = zS - H - Sigma is complex symmetric at Gamma for a real
+    Hamiltonian, so G_ji = G_ij^T and one set of right-hand sides suffices
+    (checked at every energy). Exactly the same G as Dyson's equation, much
+    cheaper when the defect region R is large (quasi-1D ribbons).
+solver='dyson': the dense Dyson solve on R, G_RR = (1 - G0_RR U)^(-1) G0_RR;
+    O(|R|^3) per energy, kept as the reference implementation.
+
 DOS
 ---
 dos_dyson(system, method, energies) gives the Mulliken DOS of the defect
@@ -159,13 +170,13 @@ class DysonSystem:
     left_orbs: np.ndarray
     right_orbs: np.ndarray
     R: np.ndarray                        # device orbitals of the defect region
-    dH_avg: np.ndarray                   # (nR, nR) scalar perturbation V_1 + V_2
-    dH_diff: np.ndarray                  # (nR, nR) Delta_1 + Delta_2 (delta-scaled)
-    dS: Optional[np.ndarray]             # (nR, nR) overlap change or None
+    dH_avg: "sparse.csr_matrix"          # (nR, nR) scalar perturbation V_1 + V_2
+    dH_diff: "sparse.csr_matrix"         # (nR, nR) Delta_1 + Delta_2 (delta-scaled)
+    dS: Optional["sparse.csr_matrix"]    # (nR, nR) overlap change or None
     adatoms: List[FoldedAdatom]
     loc: List[np.ndarray]                # vertex orbitals of i and j (local in R)
-    vertex_own: List[np.ndarray]         # static own Delta on loc[k]
-    vertex_total: List[np.ndarray]       # static total Delta on loc[k]
+    vertex_own: List["sparse.csr_matrix"]    # static own Delta on loc[k]
+    vertex_total: List["sparse.csr_matrix"]  # static total Delta on loc[k]
     defects: tuple
     anchors: tuple
     distance: float
@@ -188,7 +199,7 @@ class DysonSystem:
         for d, a, l, Do, Dt in zip(self.defects, self.anchors, self.loc,
                                    self.vertex_own, self.vertex_total):
             lines.append(f"  {d.label}: anchor atom {a}, {len(l)} vertex orbitals, "
-                         f"max|Delta| own {np.max(np.abs(Do)):.4f} / total {np.max(np.abs(Dt)):.4f} eV")
+                         f"max|Delta| own {_max_abs(Do):.4f} / total {_max_abs(Dt):.4f} eV")
         lines.append(f"  distance: {self.anchor_distance:.3f} Ang (anchors), "
                      f"{self.distance:.3f} Ang (centers)")
         for k, v in self.info.items():
@@ -347,7 +358,7 @@ class SuperpositionDyson(Superposition):
             raise ValueError("Defect region reaches the electrode cells; increase "
                              "N_buffer/N_imp or set embed_radius")
 
-        sub = lambda M: M.tocsr()[R][:, R].toarray()
+        sub = lambda M: M.tocsr()[R][:, R].tocsr()
         dH_avg_R, dH_diff_R = sub(dH_avg), sub(dH_diff)
         dS_R = sub(dS) if S_host is not None else None
 
@@ -360,12 +371,12 @@ class SuperpositionDyson(Superposition):
             extra = [f["c_dev"] for f in p["fold"]]
             v_all = np.union1d(p["v_dev"], np.concatenate(extra)) if extra else np.sort(p["v_dev"])
             l = to_loc(v_all)
-            own = np.zeros((len(l), len(l)))
             pos = np.searchsorted(v_all, p["v_dev"])
-            own[np.ix_(pos, pos)] = p["own"]
+            C = sparse.coo_matrix(p["own"])
+            own = sparse.coo_matrix((C.data, (pos[C.row], pos[C.col])), shape=(len(l), len(l))).tocsr()
             loc.append(l)
             own_v.append(own)
-            tot_v.append(dH_diff_R[np.ix_(l, l)].copy())
+            tot_v.append(dH_diff_R[l][:, l].tocsr())
 
         resolved = tuple(p["d"]["r"] for p in per_defect)
         anchors = tuple(p["anchor"] for p in per_defect)
@@ -416,15 +427,63 @@ class SuperpositionDyson(Superposition):
 # ===========================================================================
 # Exchange
 # ===========================================================================
+class _SparseDevice:
+    """Device-sized sparse pieces of U(z) (solver='sparse')."""
+
+    def __init__(self, system: DysonSystem):
+        n, R = system.H.no, system.R
+        self.n, self.R, self.system = n, R, system
+
+        def to_dev(M):
+            C = sparse.coo_matrix(M)
+            return sparse.coo_matrix((C.data, (R[C.row], R[C.col])), shape=(n, n)).tocsc()
+        self.avg = to_dev(system.dH_avg).astype(complex)
+        self.diff = to_dev(system.dH_diff).astype(complex)
+        self.dS = to_dev(system.dS).astype(complex) if system.dS is not None else None
+        self.ad_index = []
+        for ad in system.adatoms:
+            c = R[ad.c_loc]
+            rows, cols = np.meshgrid(c, c, indexing="ij")
+            self.ad_index.append((rows.ravel(), cols.ravel()))
+
+    def U(self, z, spin):
+        """Device-sized sparse U(z): spin 'nm' or 0/1, folded adatoms included."""
+        if spin == "nm":
+            M = self.avg.copy()
+        else:
+            M = self.avg + (0.5 if spin == 0 else -0.5) * self.diff
+        if self.dS is not None:
+            M = M - z * self.dS
+        for ad, (rows, cols) in zip(self.system.adatoms, self.ad_index):
+            blk = ad.sigma(z, "avg" if spin == "nm" else spin)
+            M = M + sparse.coo_matrix((blk.ravel(), (rows, cols)), shape=(self.n, self.n))
+        return M.tocsc()
+
+
+def _columns(A, cols, n):
+    """A^(-1) restricted to the given columns, from one sparse LU."""
+    rhs = np.zeros((n, len(cols)), dtype=complex)
+    rhs[cols, np.arange(len(cols))] = 1.0
+    return splu(A.tocsc()).solve(rhs)
+
+
+def _is_complex_symmetric(A, tol: float = 1e-10) -> bool:
+    d = (A - A.T).tocsr()
+    return (float(np.max(np.abs(d.data))) if d.nnz else 0.0) <= tol * max(1.0, float(np.max(np.abs(A.data))))
+
+def _dense(M):
+    return M.toarray() if sparse.issparse(M) else np.asarray(M)
+
+
 def _perturbation(system: DysonSystem, z, spin):
-    """U(z) on R: spin 'nm' (scalar, rkky_sup) or 0/1 (liechtenstein_sup)."""
+    """U(z) on R, dense (Dyson solver, DOS): spin 'nm' (rkky_sup) or 0/1 (LKAG)."""
     if spin == "nm":
-        M = system.dH_avg.astype(complex)
+        M = _dense(system.dH_avg).astype(complex)
     else:
         s = 1.0 if spin == 0 else -1.0
-        M = (system.dH_avg + 0.5 * s * system.dH_diff).astype(complex)
+        M = _dense(system.dH_avg + 0.5 * s * system.dH_diff).astype(complex)
     if system.dS is not None:
-        M = M - z * system.dS
+        M = M - z * _dense(system.dS)
     for ad in system.adatoms:
         sig = ad.sigma(z, "avg" if spin == "nm" else spin)
         M[np.ix_(ad.c_loc, ad.c_loc)] += sig
@@ -437,7 +496,8 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
                              verbose: bool = False, calculation_folder=None,
                              results_name: Optional[str] = None, write_results: bool = False,
                              comm=None, vertices: Optional[str] = None,
-                             internal_checks: bool = False):
+                             internal_checks: bool = False, solver: str = "sparse",
+                             orbital_kernel: str = "full"):
     """J from the Dyson-equation methods. Returns an ExchangeResult (Gamma point).
 
     Same kernel and conventions as calculate_exchange:
@@ -456,6 +516,12 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
                       line per contour energy.
     internal_checks : also accept 'rkky' (pristine G0), used by the tests to
                       cross-check PristineTiled.
+    solver          : 'sparse' (default; sparse LU of A0 - U per energy, right-hand
+                      sides on the vertex orbitals) or 'dyson' (dense Dyson solve on
+                      the region R). Both give the same G.
+    orbital_kernel  : with orbital_resolved: 'full' (orbital-pair kernel per energy,
+                      n_i x n_j x nE in memory), 'classes' (per energy, summed over
+                      pairs of orbital classes), 'none' (only the integrated J_orb).
     """
     import J_dependencies as JD
     method = _method(method, internal_checks=internal_checks)
@@ -469,6 +535,10 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
     if use_total and system.info.get("vertex_overlap_orbitals", 0):
         raise ValueError("liechtenstein_sup with vertices='region' requires disjoint vertex "
                          "regions; reduce radius or use vertices='own'")
+    if solver not in ("sparse", "dyson"):
+        raise ValueError("solver must be 'sparse' or 'dyson'")
+    if orbital_kernel not in ("full", "classes", "none"):
+        raise ValueError("orbital_kernel must be 'full', 'classes' or 'none'")
     rank = comm.Get_rank() if comm is not None else 0
     size = comm.Get_size() if comm is not None else 1
 
@@ -486,14 +556,19 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
         eta=lead_eta, polarized_leads=False)
     k0 = np.zeros(3)
     li, lj = system.loc
+    Vi, Vj = R[li], R[lj]                      # vertex orbitals, device indices
     p = complex(prefactor)
-    eye = np.eye(nR)
-    rhs = np.zeros((n, nR), dtype=complex)
-    rhs[R, np.arange(nR)] = 1.0
+    if solver == "dyson":
+        eye = np.eye(nR)
+        rhs = np.zeros((n, nR), dtype=complex)
+        rhs[R, np.arange(nR)] = 1.0
+    else:
+        sdev = _SparseDevice(system)
 
     def vertex(k, z):
+        """Static vertex (sparse) plus the energy-dependent correction of folded adatoms."""
         static = system.vertex_total[k] if use_total else system.vertex_own[k]
-        D = static.astype(complex)
+        D = sparse.csr_matrix(static, dtype=complex)
         l = system.loc[k]
         for ad in system.adatoms:
             if ad.owner != k:
@@ -503,16 +578,50 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
             else:
                 corr = ad.vertex_linear(z)
             pos = np.searchsorted(l, ad.c_loc)
-            D[np.ix_(pos, pos)] += corr
-        return D
+            rows, cols = np.meshgrid(pos, pos, indexing="ij")
+            D = D + sparse.coo_matrix((corr.ravel(), (rows.ravel(), cols.ravel())), shape=D.shape)
+        return D.tocsr()
 
-    def U(z, spin):
-        return _perturbation(system, z, spin)
+    def propagators(z):
+        """(G_ij, G_ji): spin up / down for LKAG, the same G for the rkky methods."""
+        if solver == "dyson":
+            sigma_leads = JD._lead_embedding(n, self_energy(z, k0, 0))
+            lu = splu((z * Sm - Hm - sigma_leads).tocsc())
+            G0 = lu.solve(rhs)[R, :]
+            del lu
+            if method == "rkky":
+                Gs = (G0, G0)
+            elif method == "rkky_sup":
+                G = np.linalg.solve(eye - G0 @ _perturbation(system, z, "nm"), G0)
+                Gs = (G, G)
+            else:
+                Gs = tuple(np.linalg.solve(eye - G0 @ _perturbation(system, z, s_), G0) for s_ in (0, 1))
+            return Gs[0][np.ix_(li, lj)], Gs[1][np.ix_(lj, li)]
+        A0 = (z * Sm - Hm - JD._lead_embedding(n, self_energy(z, k0, 0))).tocsc()
+
+        def blocks(spin):
+            A = A0 if spin is None else (A0 - sdev.U(z, spin)).tocsc()
+            if _is_complex_symmetric(A):          # G_ji = G_ij^T: one set of columns
+                Gij = _columns(A, Vj, n)[Vi, :]
+                return Gij, Gij.T
+            return _columns(A, Vj, n)[Vi, :], _columns(A, Vi, n)[Vj, :]
+        if method == "rkky":
+            return blocks(None)
+        if method == "rkky_sup":
+            return blocks("nm")
+        Gij_up, _ = blocks(0)
+        _, Gji_dn = blocks(1)
+        return Gij_up, Gji_dn
 
     kernels = np.zeros((1, len(z_array)), dtype=complex)
     orb_int = np.zeros((len(li), len(lj)), dtype=complex) if orbital_resolved else None
     orb_k = (np.zeros((1, len(z_array), len(li), len(lj)), dtype=complex)
-             if orbital_resolved and size == 1 else None)
+             if orbital_resolved and orbital_kernel == "full" and size == 1 else None)
+    cls_k = None
+    if orbital_resolved and orbital_kernel == "classes":
+        lab_i, names_i = JD.orbital_class_labels(H.geometry, Vi)
+        lab_j, names_j = JD.orbital_class_labels(H.geometry, Vj)
+        cls_k = np.zeros((1, len(z_array), len(names_i), len(names_j)), dtype=complex)
     import time
     t_start = time.perf_counter()
     if verbose and rank == 0:
@@ -520,6 +629,7 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
         vert = (f"vertices='{vertices}'" if method == "liechtenstein_sup"
                 else f"own vertices, vertex_downfold='{vertex_downfold}'")
         print(f"Method:             {method} ({vert})")
+        print(f"Solver:             {solver}")
         print(f"Defect region R:    {nR} orbitals of {n}")
         print(f"Vertex orbitals:    i={len(li)}, j={len(lj)} "
               f"(overlap {np.intersect1d(system.R[li], system.R[lj]).size})")
@@ -530,20 +640,10 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
 
     for ie in range(rank, len(z_array), size):
         z = z_array[ie]
-        sigma_leads = JD._lead_embedding(n, self_energy(z, k0, 0))
-        lu = splu((z * Sm - Hm - sigma_leads).tocsc())
-        G0 = lu.solve(rhs)[R, :]
-        del lu
-        if method == "rkky":
-            Gs = (G0, G0)
-        elif method == "rkky_sup":
-            G = np.linalg.solve(eye - G0 @ U(z, "nm"), G0)
-            Gs = (G, G)
-        else:
-            Gs = tuple(np.linalg.solve(eye - G0 @ U(z, s), G0) for s in (0, 1))
+        G_ij, G_ji = propagators(z)
         Di, Dj = vertex(0, z), vertex(1, z)
-        x = Gs[0][np.ix_(li, lj)] @ Dj          # G_ij Delta_j   (up for LKAG)
-        y = Gs[1][np.ix_(lj, li)] @ Di          # G_ji Delta_i   (down for LKAG)
+        x = np.asarray(G_ij @ Dj)              # G_ij Delta_j   (up for LKAG)
+        y = np.asarray(G_ji @ Di)              # G_ji Delta_i   (down for LKAG)
         contribution = x * y.T
         weighted = p * w_array[ie]
         kernels[0, ie] = weighted * contribution.sum()
@@ -551,6 +651,9 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
             orb_int += weighted * contribution
             if orb_k is not None:
                 orb_k[0, ie] = weighted * contribution
+            if cls_k is not None:
+                cls_k[0, ie] = weighted * JD.class_sums(contribution, lab_i, lab_j,
+                                                        len(names_i), len(names_j))
         if verbose and verbose >= 2:
             print(f"E={ie + 1}/{len(z_array)} K={kernels[0, ie]:.6g}", flush=True)
 
@@ -563,6 +666,10 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
             tot_o = np.zeros_like(orb_int) if rank == 0 else None
             comm.Reduce(orb_int, tot_o, op=MPI.SUM, root=0)
             orb_int = tot_o
+        if cls_k is not None:
+            tot_c = np.zeros_like(cls_k) if rank == 0 else None
+            comm.Reduce(cls_k, tot_c, op=MPI.SUM, root=0)
+            cls_k = tot_c
         if rank != 0:
             return None
 
@@ -576,7 +683,10 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
         k_weights=np.ones(1), energies=z_array, contour_weights=w_array,
         weighted_kernel_kE=kernels, J_orb_meV=(1000.0 * orb_int.imag if orbital_resolved else None),
         prefactor=p, spin_average=False, orb_i=R[li].copy(), orb_j=R[lj].copy(),
-        weighted_orbital_kernel_kE=orb_k, distance=system.anchor_distance)
+        weighted_orbital_kernel_kE=orb_k, distance=system.anchor_distance,
+        weighted_class_kernel_kE=cls_k,
+        class_names_i=names_i if cls_k is not None else None,
+        class_names_j=names_j if cls_k is not None else None)
     if calculation_folder is not None and write_results:
         folder = os.path.join(str(calculation_folder), results_name or f"Results_{method}")
         os.makedirs(folder, exist_ok=True)
@@ -590,7 +700,7 @@ def calculate_exchange_dyson(system: DysonSystem, method: str, energies, contour
 # Density of states of the defect region
 # ===========================================================================
 def dos_dyson(system: DysonSystem, method: str, energies, eta: float = 0.01,
-              lead_eta: float = 1e-5) -> dict:
+              lead_eta: float = 1e-5, solver: str = "sparse", comm=None) -> Optional[dict]:
     """Mulliken DOS of the defect region R (and of folded adatoms) from Dyson.
 
     method : 'rkky_sup'          nonmagnetic reference H0 + V1 + V2 (one channel)
@@ -605,6 +715,9 @@ def dos_dyson(system: DysonSystem, method: str, energies, eta: float = 0.01,
     Returns dict(energies, spins, dos (nspin, nE): sum over R and the adatom
     orbitals, orbital_dos (nspin, nE, nR), orbitals (device orbitals of R),
     adatom_dos (nspin, nE, n_adatom_orbitals) or None).
+    solver: 'sparse' (default; sparse LU of A0 - U) or 'dyson' (dense Dyson on R).
+    comm  : optional MPI communicator; energies distributed, result on rank 0
+            (the other ranks return None).
     """
     import J_dependencies as JD
     m = _method(method, internal_checks=True)
@@ -620,7 +733,7 @@ def dos_dyson(system: DysonSystem, method: str, energies, eta: float = 0.01,
     posR = np.searchsorted(Rp, R)
     S_eff = Sm[R][:, Rp].toarray()                        # S_ab, a in R, b in Rp
     if system.dS is not None:
-        S_eff[:, posR] += system.dS                       # perturbed overlap on R
+        S_eff[:, posR] += _dense(system.dS)               # perturbed overlap on R
     self_energy = JD.recursive_leads_from_hamiltonians(
         H_device=H, HamL=system.HamL, semi_L=system.semi_L, HamR=system.HamR,
         semi_R=system.semi_R, left_orbs=system.left_orbs, right_orbs=system.right_orbs,
@@ -631,15 +744,23 @@ def dos_dyson(system: DysonSystem, method: str, energies, eta: float = 0.01,
     n_h = sum(ad.S_HH.shape[0] for ad in system.adatoms) if use_ad else 0
     orb_dos = np.zeros((len(spins), len(E), nR))
     ad_dos = np.zeros((len(spins), len(E), n_h)) if use_ad else None
+    if solver not in ("sparse", "dyson"):
+        raise ValueError("solver must be 'sparse' or 'dyson'")
+    sdev = _SparseDevice(system) if solver == "sparse" else None
 
-    for ie, e in enumerate(E):
-        z = e + 1j * eta
+    rank = comm.Get_rank() if comm is not None else 0
+    size = comm.Get_size() if comm is not None else 1
+    for ie in range(rank, len(E), size):              # energies distributed over the ranks
+        z = E[ie] + 1j * eta
         A0 = (z * Sm - Hm - JD._lead_embedding(n, self_energy(z, np.zeros(3), 0))).tocsc()
-        X = splu(A0).solve(rhs)[Rp, :]                    # G0(Rp, Rp)
-        G0_RR, G0_RRp = X[np.ix_(posR, posR)], X[posR, :]
+        if solver == "dyson" or m == "rkky":
+            X = splu(A0).solve(rhs)[Rp, :]                # G0(Rp, Rp)
+            G0_RR, G0_RRp = X[np.ix_(posR, posR)], X[posR, :]
         for isp, spin in enumerate(spins):
             if m == "rkky":
                 G_RRp = G0_RRp
+            elif solver == "sparse":                      # G(R, Rp) of A0 - U directly
+                G_RRp = splu((A0 - sdev.U(z, spin)).tocsc()).solve(rhs)[R, :]
             else:
                 G_RRp = np.linalg.solve(np.eye(nR) - G0_RR @ _perturbation(system, z, spin),
                                         G0_RRp)
@@ -660,6 +781,17 @@ def dos_dyson(system: DysonSystem, method: str, energies, eta: float = 0.01,
                     ad_dos[isp, ie, k:k + len(h_ds)] = -h_ds.imag / np.pi
                     k += len(h_ds)
             orb_dos[isp, ie] = -GS.imag / np.pi
+    if comm is not None and size > 1:
+        from mpi4py import MPI
+        tot = np.zeros_like(orb_dos) if rank == 0 else None
+        comm.Reduce(orb_dos, tot, op=MPI.SUM, root=0)
+        orb_dos = tot
+        if use_ad:
+            tot_a = np.zeros_like(ad_dos) if rank == 0 else None
+            comm.Reduce(ad_dos, tot_a, op=MPI.SUM, root=0)
+            ad_dos = tot_a
+        if rank != 0:
+            return None
     dos = orb_dos.sum(axis=2) + (ad_dos.sum(axis=2) if use_ad else 0.0)
     return dict(energies=E, spins=("0",) if spins == ("nm",) else ("up", "down"),
                 dos=dos, orbital_dos=orb_dos, orbitals=R.copy(), adatom_dos=ad_dos,

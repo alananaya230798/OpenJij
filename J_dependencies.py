@@ -1,6 +1,3 @@
-import matplotlib
-from matplotlib import pyplot as plt
-import ase
 import numpy as np
 import scipy as sp
 from scipy.sparse import eye
@@ -90,7 +87,7 @@ def get_Delta_orbital_atoms(
         "dz2": {(2, 0)},
         "dxz": {(2, 1)},
         "dx2-y2": {(2, 2)},
-        "dz": {(2, -1), (2, 0), (2, 1)},
+        "dz": {(2, -1),(2,0), (2, 1)}, # removed dz2 l=2 m=0
         "d": {(2, m) for m in range(-2, 3)},
     }
     diag = np.asarray(Delta.diagonal()).real
@@ -213,8 +210,8 @@ def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_b
         original_ia = int(original_indices[ia])
         pz = [io for io, orb in enumerate(atom.orbitals)
               if orb.l == 1 and orb.m == 0]
-        dz = [io for io, orb in enumerate(atom.orbitals)
-              if orb.l == 2 and orb.m in (-1, 0, 1)]
+        dz = [io for io, orb in enumerate(atom.orbitals) # check remove the dz2 l=2 m=0
+              if orb.l == 2 and orb.m in (-1,0, 1)]
 
         # NEW: select orbitals on explicitly retained adatoms by label.
         if original_ia in extra:
@@ -668,7 +665,7 @@ def prune_ham(
             pz_idx = [io for io, orb in enumerate(atom.orbitals)if orb.l == 1 and orb.m == 0]
             # dz : dxz, dyz, dz2
             # l=2, m=-1, 0, +1
-            dz_idx = [io for io, orb in enumerate(atom.orbitals)if orb.l == 2 and orb.m in (-1, 0, 1)]
+            dz_idx = [io for io, orb in enumerate(atom.orbitals)if orb.l == 2 and orb.m in (-1,0, 1)] # check remove dz2 l=2 m=0
             # Additional atoms use their own orbital selection
             if original_ia in extra_selection:
                 label = extra_selection[original_ia]
@@ -762,6 +759,40 @@ def prune_ham(
         print(f"Orbitals: {H_0.no}")
     return H_0, H_0_DFT, eshift
 
+ORBITAL_CLASSES = ("C-pz", "H", "d", "other")
+
+
+def orbital_class_labels(geometry, orbitals):
+    """Class index of every orbital: 0 C-pz (pz of a heavy atom), 1 H (any orbital
+    of an H atom), 2 d, 3 other. Returns (labels, names of the classes present)."""
+    orbitals = np.asarray(orbitals, dtype=int)
+    atoms = geometry.o2a(orbitals)
+    labels = np.full(len(orbitals), 3, dtype=int)
+    for k, (o, a) in enumerate(zip(orbitals, atoms)):
+        a = int(a)
+        orb = geometry.atoms[a].orbitals[int(o - geometry.firsto[a])]
+        name = orb.name()
+        if geometry.atoms.Z[a] == 1:
+            labels[k] = 1
+        elif "pz" in name:
+            labels[k] = 0
+        elif getattr(orb, "l", -1) == 2 or name.lstrip("0123456789").startswith("d"):
+            labels[k] = 2
+    present = [c for c in range(len(ORBITAL_CLASSES)) if np.any(labels == c)]
+    remap = {c: i for i, c in enumerate(present)}
+    return np.array([remap[c] for c in labels], dtype=int), tuple(ORBITAL_CLASSES[c] for c in present)
+
+
+def class_sums(contribution, labels_i, labels_j, n_i, n_j):
+    """Sum an orbital-pair matrix into orbital-class blocks."""
+    out = np.zeros((n_i, n_j), dtype=complex)
+    for a in range(n_i):
+        rows = contribution[labels_i == a]
+        for b in range(n_j):
+            out[a, b] = rows[:, labels_j == b].sum()
+    return out
+
+
 @dataclass
 class ExchangeResult:
     method: str
@@ -779,6 +810,11 @@ class ExchangeResult:
     orb_j: np.ndarray
     weighted_orbital_kernel_kE: Optional[np.ndarray] = None
     distance: Optional[float] = None
+    # Per-energy kernel summed over pairs of orbital classes (C-pz, H, d, other):
+    # shape (nk, nE, n_classes_i, n_classes_j); names in class_names_i / _j.
+    weighted_class_kernel_kE: Optional[np.ndarray] = None
+    class_names_i: Optional[tuple] = None
+    class_names_j: Optional[tuple] = None
 
     def save(self, filename):
         """Store numeric results without pickled objects."""
@@ -806,6 +842,10 @@ class ExchangeResult:
             data["weighted_orbital_kernel_kE"] = self.weighted_orbital_kernel_kE
         if self.distance is not None:
             data["distance"] = float(self.distance)
+        if self.weighted_class_kernel_kE is not None:
+            data["weighted_class_kernel_kE"] = self.weighted_class_kernel_kE
+            data["class_names_i"] = np.asarray(self.class_names_i, dtype="U16")
+            data["class_names_j"] = np.asarray(self.class_names_j, dtype="U16")
         np.savez_compressed(filename, **data)
 
     @classmethod
@@ -836,7 +876,12 @@ class ExchangeResult:
                 distance=(float(f["distance"].item())
                           if "distance" in f.files and f["distance"].shape == ()
                           and f["distance"].dtype.kind in "fi" else None),
-                
+                weighted_class_kernel_kE=(f["weighted_class_kernel_kE"].copy()
+                                          if "weighted_class_kernel_kE" in f.files else None),
+                class_names_i=(tuple(str(x) for x in f["class_names_i"])
+                               if "class_names_i" in f.files else None),
+                class_names_j=(tuple(str(x) for x in f["class_names_j"])
+                               if "class_names_j" in f.files else None),
             )
 
 
@@ -1124,6 +1169,7 @@ def calculate_exchange(
     energies, contour_weights,
     spin_average=False,
     orbital_resolved=False,
+    orbital_kernel="full",
     rhs_batch=32,
     spin_independent_leads=True, # Share spin-0 leads for a physically nonmagnetic electrode
     verbose=False,
@@ -1188,6 +1234,13 @@ def calculate_exchange(
         RecursiveSI eta. For complex contour energies z, sisl uses Im(z).
     orbital_resolved : bool
         Integrate the contributions for each pair of local basis orbitals.
+    orbital_kernel : {"full", "classes", "none"}
+        What is kept per contour energy when orbital_resolved is True.
+        "full": the whole orbital-pair kernel (n_i x n_j per energy; with MPI
+        written as one file per energy and gathered by rank 0, which is slow
+        for large vertices). "classes": the kernel summed over pairs of orbital
+        classes (C-pz, H, d, other), reduced in memory, no files. "none": only
+        the energy-integrated J_orb.
     nk : tuple of 3 integers, optional
         Monkhorst-Pack counts, e.g. (21, 5, 0) for x/y sampling and
         Gamma-only z. This is the only k-point input.
@@ -1410,9 +1463,17 @@ def calculate_exchange(
     print("Generating kernel")
     kernels = np.zeros((len(kvals), len(z_array)), dtype=np.complex128)  # CHANGE: nk is a 3-tuple
     orb_integrated = np.zeros((len(orb_i_eff), len(orb_j_eff)), dtype=complex) if orbital_resolved else None
+    if orbital_kernel not in ("full", "classes", "none"):
+        raise ValueError("orbital_kernel must be 'full', 'classes' or 'none'")
+    keep_full = orbital_resolved and orbital_kernel == "full"
+    class_kernels = None
+    if orbital_resolved and orbital_kernel == "classes":
+        lab_i, names_i = orbital_class_labels(H_base.geometry, orb_i_eff)
+        lab_j, names_j = orbital_class_labels(H_base.geometry, orb_j_eff)
+        class_kernels = np.zeros((len(kvals), len(z_array), len(names_i), len(names_j)), dtype=complex)
 
     # orbital contribution for each k-point and contour energy
-    if orbital_resolved and size == 1:
+    if keep_full and size == 1:
         if calculation_folder is None:
             orb_kernels = np.zeros((len(kvals), len(z_array), len(orb_i_eff), len(orb_j_eff)), dtype=complex)
         else:
@@ -1507,7 +1568,12 @@ def calculate_exchange(
             kernels[ik, ie] = weighted * contribution.sum()
             if orbital_resolved:
                 orb_integrated += kw[ik] * weighted * contribution
-                if size == 1:
+                if class_kernels is not None:
+                    class_kernels[ik, ie] = weighted * class_sums(contribution, lab_i, lab_j,
+                                                                  len(names_i), len(names_j))
+                if not keep_full:
+                    pass
+                elif size == 1:
                     orb_kernels[ik, ie] = weighted * contribution
                 else:
                     from exchange_mpi_io import _atomic_npy
@@ -1525,12 +1591,16 @@ def calculate_exchange(
             total_orb = np.zeros_like(orb_integrated) if rank == 0 else None
             comm.Reduce(orb_integrated, total_orb, op=MPI.SUM, root=0)
             orb_integrated = total_orb
+        if class_kernels is not None:
+            total_cls = np.zeros_like(class_kernels) if rank == 0 else None
+            comm.Reduce(class_kernels, total_cls, op=MPI.SUM, root=0)
+            class_kernels = total_cls
         comm.Barrier()
         if rank != 0:
             if self_energy_mode in ("read", "compute+write") and self_energy is not None:
                 self_energy.close()
             return None
-        if orbital_resolved and size > 1:
+        if keep_full and size > 1:
             from pathlib import Path
             orb_kernels = np.lib.format.open_memmap(
                 os.path.join(calculation_folder, results_name, "weighted_orbital_kernel.npy"),
@@ -1553,7 +1623,10 @@ def calculate_exchange(
         method=method, J_meV=J, J_k_meV=J_k, kpoints=kvals,
         k_weights=kw, energies=z_array, contour_weights=w_array,
         weighted_kernel_kE=kernels, J_orb_meV=J_orb,
-        prefactor=p, spin_average=False, orb_i=orb_i_eff.copy(), orb_j=orb_j_eff.copy(),weighted_orbital_kernel_kE=orb_kernels,distance=distance)
+        prefactor=p, spin_average=False, orb_i=orb_i_eff.copy(), orb_j=orb_j_eff.copy(),weighted_orbital_kernel_kE=orb_kernels,distance=distance,
+        weighted_class_kernel_kE=class_kernels,
+        class_names_i=names_i if class_kernels is not None else None,
+        class_names_j=names_j if class_kernels is not None else None)
     if (calculation_folder is not None) and (write_results ==True) :
         result.save(os.path.join(calculation_folder, results_name, "ExchangeResult.npz"))
     return result
@@ -1591,7 +1664,7 @@ def select_retained_orbitals(H, H_idx, basis="pz"):
         for io, orb in zip(atom_orbs, atom.orbitals):
 
             pz = (orb.l == 1 and orb.m == 0)
-            dz = (orb.l == 2 and orb.m in (-1, 0, 1))
+            dz = (orb.l == 2 and orb.m in (-1,0, 1)) # removed m=0 dz2
 
             if basis == "all":
                 keep = True
@@ -2093,10 +2166,11 @@ def calculate_dos_embedding(
     eta=0.01,
     lead_eta=1e-5,
     orbitals=None,
-    rhs_batch=16,
+    rhs_batch=128,
     return_orbital_dos=False,
     include_leads=True,
     verbose=False,
+    comm=None,
 ):
     """Calculate the device DOS using the SAME A=zS-H-Sigma as calculate_exchange.
 
@@ -2114,7 +2188,10 @@ def calculate_dos_embedding(
     Set include_leads=False to obtain the isolated (unembedded) device DOS
     for comparison, using exactly the same device Hamiltonian and k-grid.
     No dense device Green's-function inverse is constructed; LU is solved
-    in small column batches instead.
+    in column batches instead (rhs_batch columns per solve).
+    comm: optional MPI communicator; the energies are distributed over the
+    ranks and the DOS is reduced to rank 0, which returns the dict (the other
+    ranks return None).
 
     Output dict:
       'energies'       (nE,)
@@ -2191,6 +2268,8 @@ def calculate_dos_embedding(
     orb_dos = (np.zeros((len(spins), len(E), len(selected)), dtype=float)
                if return_orbital_dos else None)
 
+    rank = comm.Get_rank() if comm is not None else 0
+    size = comm.Get_size() if comm is not None else 1
     for ik, kvec in enumerate(kvals):
         Sk = sparse.csc_matrix(H_ref.Sk(k=kvec, format="csr"), dtype=complex)
         # Match calculate_exchange: an unpolarized RKKY reference has no spin argument.
@@ -2201,8 +2280,8 @@ def calculate_dos_embedding(
                 H_ref.Hk(k=kvec, spin=spin, format="csr"), dtype=complex
             ) for spin in spins]
 
-        for ie, energy in enumerate(E):
-            z = energy + 1j * eta
+        for ie in range(rank, len(E), size):          # energies distributed over the ranks
+            z = E[ie] + 1j * eta
 
             # RKKY: spin 0 lead reference. Liechtenstein: shared spin 0
             # or independently evaluated lead spin channels.
@@ -2239,6 +2318,17 @@ def calculate_dos_embedding(
                     print(f"k={ik+1}/{len(kvals)} E={ie+1}/{len(E)} "
                           f"spin={spin} DOS={dos[ispin, ie]:.6g}")
 
+    if comm is not None and size > 1:
+        from mpi4py import MPI
+        tot = np.zeros_like(dos) if rank == 0 else None
+        comm.Reduce(dos, tot, op=MPI.SUM, root=0)
+        dos = tot
+        if orb_dos is not None:
+            tot_o = np.zeros_like(orb_dos) if rank == 0 else None
+            comm.Reduce(orb_dos, tot_o, op=MPI.SUM, root=0)
+            orb_dos = tot_o
+        if rank != 0:
+            return None
     return dict(energies=E, spins=("0",) if method in ("rkky", "rkky_nm") else ("up", "down"),
                 dos=dos, orbital_dos=orb_dos, orbitals=selected,
                 kpoints=kvals, k_weights=kw,

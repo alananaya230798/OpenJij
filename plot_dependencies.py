@@ -104,7 +104,15 @@ def plot_exchange_kernel(run_or_dir):
     ax[0].set_ylabel("Total weighted [meV]")
     ax[0].legend()
     korb = d / "weighted_orbital_kernel.npy"
-    if korb.is_file():
+    if "weighted_class_kernel_kE" in res.files:          # per-energy kernel per class pair
+        Kc = res["weighted_class_kernel_kE"][0]
+        names_i, names_j = res["class_names_i"], res["class_names_j"]
+        for a, na in enumerate(names_i):
+            for b, nb in enumerate(names_j):
+                if np.abs(Kc[:, a, b]).max() > 0:
+                    ax[1].scatter(z.real, 1000 * Kc[:, a, b].imag, s=10, label=f"{na}-{nb}")
+        ax[1].legend(fontsize=7)
+    elif korb.is_file():                                 # full orbital kernel (large)
         K_orb = np.load(korb, mmap_mode="r")[0]
         ci, cj = _orbital_classes(geo, "i"), _orbital_classes(geo, "j")
         for a, mi in ci.items():
@@ -250,30 +258,47 @@ def plot_vertices(run: ExchangeRun, ylim=None, vabs: float = 0.5):
     return figs
 
 
-def plot_dos(run: ExchangeRun, energies=None, eta: float = 1e-2):
+def plot_dos(run_or_dir, energies=None, eta: float = 1e-2, orbitals="region"):
     """DOS of the reference of the method, with a comparison where it exists.
 
     rkky                         pristine device
     rkky_sup, liechtenstein_sup  defect region R, compared with the pristine host on R
     rkky_nm                      NM device, compared with the FM device (if available)
     liechtenstein                FM device, spin up and down
+
+    Without `energies`, the curves computed by run_exchange(dos_energies=...) are
+    plotted (from the run, or from results_name/dos.npz for a results folder);
+    otherwise they are computed here (serially). orbitals: device builders, 'region'
+    (defect regions, default), None (total device DOS) or device orbital indices.
     """
-    E = np.linspace(-1, 1, 100) if energies is None else np.asarray(energies)
-    curves = {run.method: compute_dos(run.obj, run.method, E, eta=eta)}
-    if run.config["builder"] == "SuperpositionDyson":
-        curves["pristine host (same region)"] = compute_dos(run.obj, "rkky", E, eta=eta)
-    if run.method == "rkky_nm" and "liechtenstein" in run.obj.methods:
-        curves["FM device"] = compute_dos(run.obj, "liechtenstein", E, eta=eta)
+    from Exchange_Workflow import dos_curves, load_dos
+    is_run = isinstance(run_or_dir, ExchangeRun)
+    d = _dir(run_or_dir)
+    curves = None
+    if energies is None:
+        curves = run_or_dir.dos if is_run and run_or_dir.dos else load_dos(d)
+    if curves is None:
+        if not is_run:
+            raise ValueError(f"{d} has no dos.npz: run run_exchange(..., dos_energies=...) "
+                             "or pass the ExchangeRun and energies")
+        E = np.linspace(-1, 1, 100) if energies is None else np.asarray(energies)
+        curves = dos_curves(run_or_dir.obj, run_or_dir.method, run_or_dir.config["builder"], E,
+                            eta=eta, orbitals=orbitals)
+    meta = curves.pop("_meta", None) if isinstance(curves, dict) else None
+    method = run_or_dir.method if is_run else (meta or {}).get("method", "")
+    builder = run_or_dir.config["builder"] if is_run else ""
+    E = next(iter(curves.values()))["energies"]
     fig, ax = plt.subplots(figsize=(4.5, 4))
-    for label, d in curves.items():
-        for k, s in enumerate(d["spins"]):
-            ax.plot(E, d["dos"][k], label=f"{label} {s}" if len(d["spins"]) > 1 else label, lw=1)
+    for label, c in curves.items():
+        for k, sp in enumerate(c["spins"]):
+            ax.plot(E, c["dos"][k], label=f"{label} {sp}" if len(c["spins"]) > 1 else label, lw=1)
     ax.set_xlabel("Energy [eV]")
-    ax.set_ylabel("DOS [states/eV]" + (" of R" if run.config["builder"] == "SuperpositionDyson" else ""))
+    region = builder == "SuperpositionDyson" or (meta or {}).get("orbitals", orbitals) == "region"
+    ax.set_ylabel("DOS [states/eV]" + (" of the defect region" if region else ""))
     ax.set_ylim(0, None)
-    ax.set_xlim(min(energies), max(energies))
+    ax.set_xlim(np.min(E), np.max(E))
     ax.legend(fontsize=7)
-    ax.set_title(f"{run.method}: DOS")
+    ax.set_title(f"{method}: DOS")
     plt.tight_layout()
     return fig, curves
 

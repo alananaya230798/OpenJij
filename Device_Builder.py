@@ -560,7 +560,7 @@ class PristineTiled:
                  site_tol: float = 0.3, region: str = "all", radius: float = 3.5,
                  atom_mask=None, nm_tol: float = 1e-3, verbose: bool = True,
                  downfold: bool = False, align_radius: Optional[float] = None,
-                 ends_tol: float = 2*1e-3, overlap_tol: float = 1e-3):
+                 ends_tol: float = 5*1e-3, overlap_tol: float = 1e-3):
         if len(defects) != 2:
             raise ValueError("defects must contain two specs (i, j)")
         if int(n_dist) < 0:
@@ -1607,7 +1607,8 @@ class DFTDevice:
 # ===========================================================================
 def compute_dos(obj, method: str, energies, eta: float = 0.01, orbitals=None,
                 return_orbital_dos: bool = False, lead_eta: float = 1e-5, nk=(1, 0, 0),
-                rhs_batch: int = 16, include_leads: bool = True, verbose: bool = False):
+                rhs_batch: int = 128, include_leads: bool = True, verbose: bool = False,
+                comm=None, solver: str = "sparse"):
     """DOS of the reference used by `method`, for any builder output.
 
     obj    : Device (PristineTiled, Superposition, DFTDevice) or DysonSystem
@@ -1622,17 +1623,29 @@ def compute_dos(obj, method: str, energies, eta: float = 0.01, orbitals=None,
                   the total device DOS.
     DysonSystem -> DOS projected on the defect region R, plus the orbitals of
                   downfolded adatoms (see Dyson_Exchange.dos_dyson).
+    orbitals : Device only. None -> all device orbitals (total DOS); 'region' ->
+               the defect regions (union of the vertex orbitals of `method`, as
+               the region R of the Dyson DOS); or an array of device orbitals.
+               The cost is proportional to the number of orbitals.
+    comm     : optional MPI communicator; the energies are distributed over the
+               ranks, rank 0 returns the dict and the other ranks None.
+    solver   : DysonSystem only, 'sparse' (default) or 'dyson'.
     Returns a dict with 'energies', 'spins', 'dos' (nspin, nE), 'orbital_dos', ...
     """
     if type(obj).__name__ == "DysonSystem":
         from Dyson_Exchange import dos_dyson
-        return dos_dyson(obj, method, energies, eta=eta, lead_eta=lead_eta)
+        return dos_dyson(obj, method, energies, eta=eta, lead_eta=lead_eta, solver=solver,
+                         comm=comm)
     JD = _JD()
     kw = obj.exchange_kwargs(method)
+    if isinstance(orbitals, str):
+        if orbitals != "region":
+            raise ValueError("orbitals must be None, 'region' or an array of device orbitals")
+        orbitals = np.union1d(*[np.asarray(o) for o in obj.vertices(method)[1]])
     return JD.calculate_dos_embedding(
         method=kw["method"], H_ref=kw["H_ref"], HamL=kw["HamL"], semi_L=kw["semi_L"],
         HamR=kw["HamR"], semi_R=kw["semi_R"], energies=energies, nk=nk,
         left_orbs=kw["left_orbs"], right_orbs=kw["right_orbs"],
         spin_independent_leads=True, eta=eta, lead_eta=lead_eta, orbitals=orbitals,
         rhs_batch=rhs_batch, return_orbital_dos=return_orbital_dos,
-        include_leads=include_leads, verbose=verbose)
+        include_leads=include_leads, verbose=verbose, comm=comm)

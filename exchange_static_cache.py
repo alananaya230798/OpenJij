@@ -1,309 +1,154 @@
-"""Disk cache for local exchange vertices and H-adatom downfolding blocks.
+"""Load-first cache of the built device / Dyson system for Exchange_Workflow.run_exchange.
 
-Designed for Exchange_Workflow.run_exchange and its existing Device / DysonSystem.
-Only rank 0 writes. Other MPI ranks read the completed cache in 'read' mode.
+Building a device is the slow, file-heavy part before the contour integral:
+reading the SIESTA files, pruning, energy alignment, mapping, vertex (Delta)
+extraction and the downfolding blocks. This cache stores the BUILT object
+(Device or DysonSystem) together with the pruned pristine Hamiltonian, and on
+the next run loads it INSTEAD of building:
 
-Files live inside each Results_.../Static directory (not folder/Deltas).
-Numerically compatible static matrices are reused. In auto mode, incompatible
-matrices are regenerated from the CURRENT built DFT Hamiltonians rather than
-blocking restart; in read mode incompatibilities fail (MPI safety).
+    key found and equal  -> load folder/results_name/Static/build.pkl (no DFT file is read)
+    key missing/changed  -> build as usual, then write the cache
 
-The cached hydrogen matrices are *static* H_CH, H_HC, H_HH, S_CH, S_HC,
-S_HH, plus the carbon->device orbital map. Sigma_H(z) remains evaluated
-at every contour energy by the original calculation routines.
+The key contains every setting that changes the build, the fingerprints of the
+input files (path, size, modification time) and the hash of the builder source
+code. Re-running SIESTA, changing a setting or editing a builder module therefore
+rebuilds automatically. If an input file is missing (e.g. results copied to
+another machine) the cached build is used as it is, with a notice.
 
-The parent builder still constructs the reference Hamiltonian and derives
-its vertices. Cached matrices are checked against those currently computed
-before they are used, preventing silent reuse after input changes.
+Only rank 0 reads or writes the cache; the other MPI ranks receive the object
+by broadcast. The local Delta matrices are also written as Delta_i.npz /
+Delta_j.npz (exchange_mpi_io.save_local_delta) for inspection.
+
+The electrode self-energies have their own cache (TBTGF, exchange_cache_policy).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pickle
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from scipy import sparse
-from exchange_mpi_io import load_local_delta, save_local_delta
 
-SCHEMA = 2
-_ATOL = 1.0e-7  # eV, local Hamiltonian/vertex compatibility
-_S_ATOL = 1.0e-9  # dimensionless overlap compatibility
+SCHEMA = 3
+_SOURCES = ("Device_Builder", "Dyson_Exchange", "defects_dependencies", "J_dependencies")
 
 
-def _atomic_npz(path, **values):
-    path = Path(path)
+def _atomic_bytes(path: Path, data: bytes) -> None:
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
     try:
-        with open(tmp, "wb") as stream:
-            np.savez_compressed(stream, **values)
+        tmp.write_bytes(data)
         os.replace(tmp, path)
     finally:
-        if tmp.exists():
-            tmp.unlink()
+        tmp.unlink(missing_ok=True)
 
 
-def _atomic_json(path, obj):
-    path = Path(path)
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+def _atomic_json(path: Path, obj) -> None:
+    _atomic_bytes(path, (json.dumps(obj, indent=2, sort_keys=True) + "\n").encode())
+
+
+def file_fingerprint(path) -> dict:
+    """Path, size and modification time of an input file (None values if missing)."""
+    p = Path(path)
     try:
-        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+        st = p.stat()
+        return {"path": str(p.resolve()), "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+    except OSError:
+        return {"path": str(p.resolve()), "size": None, "mtime_ns": None}
 
 
-def _assert_array_matches(path, field, saved, current):
-    saved, current = np.asarray(saved), np.asarray(current)
-    if saved.shape != current.shape:
-        raise ValueError(f"{path}: {field} shape changed: {saved.shape} != {current.shape}")
-    if (np.issubdtype(saved.dtype, np.integer) or saved.dtype.kind == 'b'):
-        if not np.array_equal(saved, current):
-            raise ValueError(f"{path}: {field} changed (integer orbital mapping)")
-    elif np.issubdtype(saved.dtype, np.number) and np.issubdtype(current.dtype, np.number):
-        tol = _S_ATOL if field.startswith('S_') else _ATOL
-        if not np.allclose(saved, current, rtol=1e-10, atol=tol, equal_nan=False):
-            delta = np.max(np.abs(saved - current)) if saved.size else 0.0
-            raise ValueError(f"{path}: cached {field} differs by {delta:.3g}")
-    elif not np.array_equal(saved, current):
-        raise ValueError(f"{path}: cached {field} changed; remove the cache or choose "
-                         "another results_name")
+def source_fingerprint() -> str:
+    """SHA-256 of the source code of the modules that build the devices."""
+    import importlib
+    h = hashlib.sha256()
+    for name in _SOURCES:
+        mod = importlib.import_module(name)
+        h.update(Path(mod.__file__).read_bytes())
+    return h.hexdigest()
 
 
-def _delta_pair(obj, method):
-    """Return selected static vertices and how to assign loaded versions."""
-    if hasattr(obj, "vertex_own") and hasattr(obj, "vertex_total"):
-        is_total = (method == "liechtenstein_sup"
-                    and obj.info.get("vertices", "own") == "region")
-        slot = "vertex_total" if is_total else "vertex_own"
-        D = [sparse.csr_matrix(d) for d in getattr(obj, slot)]
-        o = [np.asarray(x, dtype=np.int64) for x in obj.orbs]
-
-        def assign(matrices, indices):
-            setattr(obj, slot, [d.toarray() for d in matrices])
-            # loc/R already used by Dyson propagators; indices must match.
-        return D, o, assign
-
-    D, o = obj.vertices(method)
-    D = [sparse.csr_matrix(d) for d in D]
-    o = [np.asarray(x, dtype=np.int64) for x in o]
-
-    def assign(matrices, indices):
-        obj.Deltas = matrices
-        obj.orbs = indices
-        if method in obj.vertex_sets:
-            obj.vertex_sets[method] = (matrices, indices)
-    return D, o, assign
+def build_key(settings: dict, input_files) -> dict:
+    """Cache key: build settings, input-file fingerprints, builder source hash."""
+    return {"schema": SCHEMA, "settings": json.loads(json.dumps(settings, default=str)),
+            "files": [file_fingerprint(f) for f in input_files],
+            "sources": source_fingerprint()}
 
 
-def _load_or_write_delta(path, matrix, orbitals, mode):
-    matrix = sparse.csr_matrix(matrix, dtype=np.complex128)
-    orbitals = np.asarray(orbitals, dtype=np.int64)
-    if path.is_file():
-        try:
-            saved, saved_orbs = load_local_delta(path)
-            if not np.array_equal(saved_orbs, orbitals):
-                raise ValueError("orbital indices changed")
-            if saved.shape != matrix.shape:
-                raise ValueError("delta shape changed")
-            difference = (sparse.csr_matrix(saved) - matrix).tocsr()
-            if difference.nnz and np.max(np.abs(difference.data)) > _ATOL:
-                raise ValueError(f"delta changed by {np.max(np.abs(difference.data)):.3g} eV")
-            return sparse.csr_matrix(saved), np.asarray(saved_orbs, dtype=np.int64)
-        except (ValueError, OSError, KeyError) as exc:
-            if mode == "read":
-                raise ValueError(f"Incompatible local cache {path}: {exc}") from exc
-            print(f"[static cache] refreshing {path.name}: {exc}", flush=True)
-    elif mode == "read":
-        raise FileNotFoundError(f"Missing static delta for MPI reader: {path}")
-    save_local_delta(path, matrix, orbitals)
-    return sparse.csr_matrix(matrix), orbitals
+def cache_dir(folder, results_name) -> Path:
+    return Path(folder) / str(results_name) / "Static"
 
 
-def _pristine_h_payload(data, mapped):
-    values = {
-        "kind": np.array("pristine_h"),
-        "basis": np.array(str(data.get("basis", ""))),
-        "c_orbs": np.asarray(data["c_orbs"], dtype=np.int64),
-        "h_orbs": np.asarray(data["h_orbs"], dtype=np.int64),
-        "mapped_c_orbs": np.asarray(mapped, dtype=np.int64),
-    }
-    for key in ("S_CH", "S_HC", "S_HH", "S_CC"):
-        if key in data:
-            values[key] = np.asarray(data[key])
-    for spin, letter in ((0, "up"), (1, "dn")):
-        for key in ("H_CH", "H_HC", "H_HH", "H_CC"):
-            if key in data[spin]:
-                values[f"{letter}_{key}"] = np.asarray(data[spin][key])
-    return values
+def _difference(previous: dict, key: dict) -> Optional[str]:
+    """Why a stored key does not match (None: it matches, possibly with missing inputs)."""
+    if previous.get("schema") != key["schema"]:
+        return "cache format changed"
+    if previous.get("sources") != key["sources"]:
+        return "builder source code changed"
+    changed = sorted(k for k in set(previous["settings"]) | set(key["settings"])
+                     if previous["settings"].get(k) != key["settings"].get(k))
+    if changed:
+        return f"settings changed: {changed}"
+    old = {f["path"]: f for f in previous["files"]}
+    for f in key["files"]:
+        o = old.get(f["path"])
+        if o is None:
+            return f"new input file {f['path']}"
+        if f["size"] is None:          # input missing here: keep the cached build
+            continue
+        if (o["size"], o["mtime_ns"]) != (f["size"], f["mtime_ns"]):
+            return f"input file changed: {f['path']}"
+    return None
 
 
-def _load_pristine_h(payload):
-    data = {
-        "basis": str(payload["basis"].item()),
-        "c_orbs": payload["c_orbs"].copy(),
-        "h_orbs": payload["h_orbs"].copy(),
-    }
-    for key in ("S_CH", "S_HC", "S_HH", "S_CC"):
-        if key in payload:
-            data[key] = payload[key].copy()
-    for spin, letter in ((0, "up"), (1, "dn")):
-        data[spin] = {}
-        for key in ("H_CH", "H_HC", "H_HH", "H_CC"):
-            k = f"{letter}_{key}"
-            if k in payload:
-                data[spin][key] = payload[k].copy()
-    return data, payload["mapped_c_orbs"].copy()
+def load_build(path, key, verbose: bool = True) -> Optional[dict]:
+    """The cached build if its key matches, else None (with the reason printed)."""
+    path = Path(path)
+    say = print if verbose else (lambda *a, **k: None)
+    if not (path / "build_key.json").is_file() or not (path / "build.pkl").is_file():
+        say(f"[build cache] nothing cached in {path}; building", flush=True)
+        return None
+    try:
+        reason = _difference(json.loads((path / "build_key.json").read_text()), key)
+    except Exception as exc:
+        reason = f"unreadable key ({type(exc).__name__})"
+    if reason:
+        say(f"[build cache] {reason}; rebuilding", flush=True)
+        return None
+    try:
+        with open(path / "build.pkl", "rb") as f:
+            payload = pickle.load(f)
+    except Exception as exc:
+        say(f"[build cache] cannot load build.pkl ({type(exc).__name__}: {exc}); rebuilding", flush=True)
+        return None
+    missing = [f["path"] for f in key["files"] if f["size"] is None]
+    if missing:
+        say(f"[build cache] input files not found, using the cached build as it is: {missing}", flush=True)
+    say(f"[build cache] loaded the built device from {path} (no DFT file read)", flush=True)
+    return payload
 
 
-def _dyson_h_payload(ad):
-    values = {
-        "kind": np.array("dyson_h"),
-        "owner": np.array(ad.owner),
-        "c_loc": np.asarray(ad.c_loc, dtype=np.int64),
-    }
-    for key in ("S_CH", "S_HC", "S_HH"):
-        values[key] = np.asarray(getattr(ad, key))
-    for key in ("H_CH", "H_HC", "H_HH"):
-        values[f"up_{key}"] = np.asarray(getattr(ad, key)[0])
-        values[f"dn_{key}"] = np.asarray(getattr(ad, key)[1])
-    return values
+def _vertices(obj, method):
+    """Static vertices (sparse) and their device orbitals, for the Delta files."""
+    if hasattr(obj, "vertex_own"):                       # DysonSystem
+        total = method == "liechtenstein_sup" and obj.info.get("vertices", "own") == "region"
+        Ds = obj.vertex_total if total else obj.vertex_own
+        return [sparse.csr_matrix(D) for D in Ds], [np.asarray(o, dtype=np.int64) for o in obj.orbs]
+    Ds, os_ = obj.vertices(method)
+    return [sparse.csr_matrix(D) for D in Ds], [np.asarray(o, dtype=np.int64) for o in os_]
 
 
-def _load_or_write_h(path, current, mode):
-    if path.is_file():
-        try:
-            with np.load(path, allow_pickle=False) as f:
-                saved = {key: f[key].copy() for key in f.files}
-            if saved.keys() != current.keys():
-                raise ValueError("saved static-block schema changed")
-            for name, value in current.items():
-                _assert_array_matches(path, name, saved[name], value)
-            return saved
-        except (ValueError, OSError, KeyError) as exc:
-            if mode == "read":
-                raise ValueError(f"Incompatible H/static cache {path}: {exc}") from exc
-            print(f"[static cache] refreshing {path.name}: {exc}", flush=True)
-    elif mode == "read":
-        raise FileNotFoundError(f"Missing static H blocks for MPI reader: {path}")
-    _atomic_npz(path, **current)
-    return current
-
-
-def cache_exchange_static(obj, method, folder, results_name, *, basis,
-                          defect_i, defect_j, n_dist, downfold, region, radius,
-                          vertices, N_imp, N_buffer, axis, mode="auto", save_deltas=True):
-    """Load cached static vertices and H blocks (or write them if absent).
-
-    Parameters
-    ----------
-    mode : {'auto', 'read'}
-        'auto' is rank 0 only. It creates files when absent, otherwise loads
-        and validates. 'read' is for the other MPI ranks after rank 0 completed.
-
-    Warning: the builder still reads the DFT inputs to create the device and
-    cross-check caches. This is a validated cache, not a skip-build shortcut.
-    """
-    if mode not in ("auto", "read"):
-        raise ValueError("mode must be 'auto' or 'read'")
-    path = Path(folder) / str(results_name) / "Static"
-    if mode == "auto":
-        path.mkdir(parents=True, exist_ok=True)
-    info = {
-        "schema": SCHEMA, "method": str(method), "basis": str(basis),
-        "defect_i": str(defect_i), "defect_j": str(defect_j),
-        "n_dist": int(n_dist), "downfold": bool(downfold),
-        "region": str(region), "radius": float(radius),
-        "vertices": str(vertices),
-        "N_imp": None if N_imp is None else int(N_imp),
-        "N_buffer": int(N_buffer), "axis": int(axis),
-        "save_deltas": bool(save_deltas),
-    }
-    config_path = path / "static_config.json"
-    if config_path.is_file():
-        previous = json.loads(config_path.read_text())
-        if previous != info:
-            if mode == "read":
-                raise ValueError(f"{config_path}: static cache settings differ")
-            print("[static cache] settings changed; refreshing Static/", flush=True)
-            for old in path.glob('*.npz'):
-                old.unlink()
-            _atomic_json(config_path, info)
-    elif mode == "read":
-        raise FileNotFoundError(f"Missing static cache manifest: {config_path}")
-
-    # Cache two compact local Delta matrices only when requested.
-    loaded = None
+def save_build(path, key, payload: dict, method: str, save_deltas: bool = True) -> Path:
+    """Write the build (pickle) and its key atomically; optionally the Delta files."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    _atomic_bytes(path / "build.pkl", pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
     if save_deltas:
-        matrices, indices, assign = _delta_pair(obj, method)
-        if len(matrices) != 2 or len(indices) != 2:
-            raise ValueError("Two vertices (i, j) are required")
-        loaded = []
-        for k, (D, orbitals) in enumerate(zip(matrices, indices)):
-            filename = path / f"Delta_{'ij'[k]}.npz"
-            loaded.append(_load_or_write_delta(filename, D, orbitals, mode))
-
-    # For Dyson's G0-dressed reference, retain the static scattering matrices
-    # used to assemble U(z), in addition to the spin vertices. This allows the
-    # same static Dyson reference to be inspected or restored from disk.
-    dyson_static = None
-    if hasattr(obj, "dH_avg") and hasattr(obj, "dH_diff"):
-        dyson_current = {
-            "kind": np.array("dyson_reference"),
-            "R": np.asarray(obj.R, dtype=np.int64),
-            "dH_avg": np.asarray(obj.dH_avg),
-            "dH_diff": np.asarray(obj.dH_diff),
-            "dS_present": np.array(obj.dS is not None),
-            "dS": np.asarray(obj.dS) if obj.dS is not None else np.empty((0, 0)),
-        }
-        dyson_static = _load_or_write_h(
-            path / "Dyson_reference_static.npz", dyson_current, mode)
-
-    # Keep separate unmodified static blocks; sigma_H(E) is NEVER cached at
-    # just one energy, because it must be evaluated at each contour point.
-    updates = []
-    if downfold and getattr(obj, "downfold_kwargs", None):
-        kw = obj.downfold_kwargs
-        for letter in "ij":
-            d = kw[f"hydrogen_{letter}"]
-            mapped = kw[f"mapped_c_orbs_{letter}"]
-            source = _pristine_h_payload(d, mapped)
-            filename = path / f"Hydrogen_{letter}.npz"
-            saved = _load_or_write_h(filename, source, mode)
-            data, mapped = _load_pristine_h(saved)
-            updates.append((letter, data, mapped))
-    elif downfold and hasattr(obj, "adatoms"):
-        for ia, ad in enumerate(obj.adatoms):
-            letter = "ij"[ad.owner]
-            filename = path / f"Hydrogen_{letter}_{ia}.npz"
-            source = _dyson_h_payload(ad)
-            saved = _load_or_write_h(filename, source, mode)
-            updates.append((ad, saved))
-    elif downfold:
-        raise ValueError(f"downfold=True but {type(obj).__name__} lacks H blocks")
-
-    # Changes are only applied after *all* cached files have passed checks.
-    if loaded is not None:
-        assign([x[0] for x in loaded], [x[1] for x in loaded])
-    if dyson_static is not None:
-        obj.dH_avg = dyson_static["dH_avg"].copy()
-        obj.dH_diff = dyson_static["dH_diff"].copy()
-        obj.dS = (dyson_static["dS"].copy()
-                  if bool(dyson_static["dS_present"].item()) else None)
-    if getattr(obj, "downfold_kwargs", None) and downfold:
-        for letter, data, mapped in updates:
-            obj.downfold_kwargs[f"hydrogen_{letter}"] = data
-            obj.downfold_kwargs[f"mapped_c_orbs_{letter}"] = mapped
-    elif downfold and hasattr(obj, "adatoms"):
-        for ad, payload in updates:
-            ad.owner = int(payload["owner"].item())
-            ad.c_loc = payload["c_loc"].copy()
-            for k in ("S_CH", "S_HC", "S_HH"):
-                setattr(ad, k, payload[k].copy())
-            for k in ("H_CH", "H_HC", "H_HH"):
-                setattr(ad, k, [payload[f"up_{k}"].copy(), payload[f"dn_{k}"].copy()])
-
-    if mode == "auto" and not config_path.exists():
-        _atomic_json(config_path, info)
+        from exchange_mpi_io import save_local_delta
+        Ds, os_ = _vertices(payload["obj"], method)
+        for k, (D, o) in enumerate(zip(Ds, os_)):
+            save_local_delta(path / f"Delta_{'ij'[k]}.npz", D, o)
+    _atomic_json(path / "build_key.json", key)          # last: marks the cache complete
     return path

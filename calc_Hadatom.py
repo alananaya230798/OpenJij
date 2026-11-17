@@ -109,7 +109,7 @@ if IS_DFT_DEVICE:
 if EFFECTIVE_DOWNFOLD:
     results_name += "_downfold"
 
-SAVE_DOS = False
+SAVE_DOS = False                      # DOS computed with all MPI ranks inside run_exchange
 DOS_ENERGIES = np.linspace(-1,1,100)
 SAVE_PDF = False
 PLOT_DPI = 200
@@ -189,6 +189,7 @@ def main():
         lead_eta=LEAD_ETA,
         self_energy_mode=SELF_ENERGY_MODE,
         orbital_resolved=True,
+        dos_energies=DOS_ENERGIES if SAVE_DOS else None,   # -> results_name/dos.npz
         write_results=True,
         verbose=True,
         comm=comm,
@@ -211,7 +212,7 @@ def main():
     #save_fig(plot_exchange_kernel(run.results_dir), "04_exchange_kernel", plot_dir)
     #save_fig(plot_atomic_contributions(run.results_dir), "05_atomic_contributions", plot_dir)
     if SAVE_DOS:
-        fig, _curves = plot_dos(run, energies=DOS_ENERGIES)
+        fig, _curves = plot_dos(run)          # plots the curves computed in parallel
         save_fig(fig, "06_reference_DOS", plot_dir)
 
     (plot_dir / "summary.txt").write_text(run.summary() + "\n")

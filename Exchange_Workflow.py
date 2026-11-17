@@ -34,10 +34,12 @@ be a dict with explicit indices (defects_dependencies.load_defects), e.g.
     "2B-2": {"type": "heteroatom", "file": ".../siesta.fdf", "indices": [40, 51],
              "Z": "B", "anchor": 51}
 
-MPI: run_exchange(..., comm=MPI.COMM_WORLD). Rank 0 reads the inputs and builds
-the device (build_on_root broadcasts it and re-raises errors on every rank), the
-contour energies are shared by all ranks, rank 0 writes the results and returns
-the ExchangeRun; the other ranks return None. exchange_run.py is the driver.
+MPI: run_exchange(..., comm=MPI.COMM_WORLD). Rank 0 reads the inputs and loads
+the built device from the cache (or builds and caches it); the other ranks receive
+it by broadcast and read no file. Errors on rank 0 are raised on every rank. The
+contour energies are shared by all ranks, BLAS threads are limited per rank
+(blas_threads), rank 0 writes the results and returns the ExchangeRun; the other
+ranks return None. exchange_run.py is the driver.
 
 The visualizations are in plot_dependencies.py:
 
@@ -61,11 +63,13 @@ import scipy.sparse as sps
 
 import J_dependencies as JD
 from defects_dependencies import auto_spec, load_defects
-from Device_Builder import PristineTiled, DFTDevice, build_on_root, canonical_method
+from Device_Builder import PristineTiled, DFTDevice, canonical_method
 from Dyson_Exchange import SuperpositionDyson, calculate_exchange_dyson
-from exchange_static_cache import cache_exchange_static
+from exchange_static_cache import build_key, cache_dir, load_build, save_build
+from exchange_mpi_io import limit_blas_threads
 
-__all__ = ["run_exchange", "ExchangeRun", "load_inputs", "load_results", "METHODS",
+__all__ = ["run_exchange", "ExchangeRun", "load_inputs", "load_results", "load_dos",
+           "dos_curves", "METHODS",
            "DEFAULT_PREFACTOR"]
 
 METHODS = {"rkky": "PristineTiled", "rkky_sup": "SuperpositionDyson",
@@ -144,6 +148,7 @@ class ExchangeRun:
     contour: dict
     specs: tuple = ()
     info: Dict = field(default_factory=dict)
+    dos: Optional[dict] = None   # DOS curves computed by run_exchange(dos_energies=...)
 
     @property
     def J_meV(self) -> float:
@@ -189,8 +194,11 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                  self_energy_mode: str = "compute", orbital_resolved: bool = True,
                  write_results: bool = True, verbose: bool = True,
                  builder_kwargs: Optional[dict] = None, comm=None,
-                 cache_static: bool = True,
-                 save_deltas: bool = True) -> Optional[ExchangeRun]:
+                 cache_static: bool = True, save_deltas: bool = True,
+                 force_rebuild: bool = False, solver: str = "sparse",
+                 orbital_kernel: str = "classes",
+                 blas_threads="auto", dos_energies=None, dos_eta: float = 0.01,
+                 dos_orbitals="region") -> Optional[ExchangeRun]:
     """Compute J for one defect pair with any implemented method.
 
     method          : 'rkky', 'rkky_sup', 'liechtenstein_sup' ('lkag_sup'),
@@ -216,15 +224,25 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     align           : band alignment of the pruned pristine Hamiltonian (prune_ham)
     self_energy_mode: 'compute' (default); 'compute+write' / 'read' cache the lead
                       self-energies in folder/Self_Energies (calculate_exchange only)
-    save_deltas     : if False, cache H blocks and Dyson reference only.
-    cache_static    : save/read static Delta and H-downfolding blocks in
-                      folder/results_name/Static, independently of lead caching.
-                      Validates against current builder data each run.
-    builder_kwargs  : extra keyword arguments for the builder (e.g. tol, embed_radius)
-    comm            : MPI communicator (e.g. MPI.COMM_WORLD) to share the contour
-                      energies between ranks; rank 0 returns the ExchangeRun, the
-                      other ranks None. With MPI, the DFT/PristineTiled methods let
-                      calculate_exchange write the results (it needs the folder).
+    cache_static    : load-first cache of the built device in folder/results_name/Static:
+                      if the build key (settings, input-file fingerprints, builder
+                      source) matches, the built device is loaded and no DFT file
+                      is read; otherwise it is built and saved.
+    save_deltas     : also write Delta_i.npz / Delta_j.npz to Static/ (inspection).
+    force_rebuild   : ignore the cache once (it is rewritten).
+    solver          : Dyson methods: 'sparse' (default) or 'dyson' (dense, reference).
+    orbital_kernel  : per-energy orbital output with orbital_resolved: 'classes'
+                      (default; kernel per pair of orbital classes, small, no files),
+                      'full' (orbital-pair kernel per energy: n_i x n_j x nE, large;
+                      with MPI one file per energy) or 'none'. J_orb is always kept.
+    blas_threads    : with MPI, BLAS threads per rank: 'auto' (cores of the node /
+                      ranks on the node), an integer, or None to leave them alone.
+    dos_energies    : energies (eV) for the DOS of the reference (and its comparison
+                      curve), computed with all ranks after J and saved as
+                      results_name/dos.npz; plot_dos then plots them. None: no DOS.
+    dos_eta         : broadening of the DOS (eV).
+    dos_orbitals    : device builders: 'region' (defect regions, default), None
+                      (total device DOS) or device orbital indices.
     """
     method = canonical_method(method)
     if method not in METHODS:
@@ -242,43 +260,26 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
         vertex_source = "fm"
 
     def prepare():
-        """Steps 1-4 (rank 0): inputs, contour, H_0, defect specs, builder."""
+        """Steps 1-4 (rank 0): inputs and contour; the built device from the cache
+        (no DFT file read) or from pruning, defect specs and the builder."""
         data = load_inputs(inputs)
         system_name = data.get("system_name", "GNR")
         # 1. contour
         contour = _read_contour(cc_file)
         say(f"Contour: {len(contour['En'])} energies, mu = {contour['mu']} eV, T = {contour['T']} K")
-        # 2. pristine Hamiltonian -> H_0 and electrodes
         if "PRISTINE_FILE" not in data:
             raise ValueError("The input file must define PRISTINE_FILE (pristine electrode)")
-        H_0, H_0_DFT, eshift = JD.prune_ham(data["PRISTINE_FILE"], basis=basis, align=align)
-        say(f"Pristine cell: {H_0.na} atoms, {H_0.no} orbitals (basis {basis}, align {align})")
+        folder_ = Path(folder) if folder is not None else Path(f"H_{system_name}_{basis}_{method}")
+        name_ = results_name or _default_results_name(
+            method, defect_i, defect_j, n_dist, downfold, region, radius, vertices, vertex_source)
 
-        # 3. defect specs: a file (detected automatically) or explicit indices (dict)
-        def spec(label):
-            files = data["DEFECT_FILES"]
+        files = data["DEFECT_FILES"]
+        needs_single = builder_name != "DFTDevice" or vertex_source == "single"
+        for label in ((defect_i, defect_j) if needs_single else ()):
             if label not in files:
                 raise KeyError(f"'{label}' not in DEFECT_FILES ({list(files)})")
-            if isinstance(files[label], dict):
-                return load_defects({label: files[label]})[label]
-            if defect_type == "adatom":
-                return auto_spec(label, files[label], "adatom", species=adatom_species)
-            return auto_spec(label, files[label], "heteroatom", Z=Z)
-
-        needs_single = builder_name != "DFTDevice" or vertex_source == "single"
-        specs = (spec(defect_i), spec(defect_j)) if needs_single else ()
-
-        # 4. builder
-        extra = dict(builder_kwargs or {})
-        extra.setdefault("verbose", verbose)
-        if builder_name == "PristineTiled":
-            builder = PristineTiled(H_0, specs, n_dist, basis=basis, N_imp=N_imp, N_buffer=N_buffer,
-                                    region=region, radius=radius, downfold=downfold, **extra)
-        elif builder_name == "SuperpositionDyson":
-            builder = SuperpositionDyson(H_0, specs, n_dist, basis=basis, N_imp=N_imp,
-                                         N_buffer=N_buffer, region=region, radius=radius,
-                                         downfold=downfold, vertices=vertices, **extra)
-        else:
+        fm = nm = None
+        if builder_name == "DFTDevice":
             templates = data.get("DEVICE_FILES", {})
             fill = dict(defect_i=defect_i, defect_j=defect_j, n_dist=n_dist, system_name=system_name)
             fm = templates.get("FM", "").format(**fill) or None
@@ -289,17 +290,73 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                 raise ValueError("rkky_nm needs DEVICE_FILES['NM'] in the input file")
             if method == "rkky_nm" and vertex_source == "fm" and fm is None:
                 raise ValueError("rkky_nm with vertex_source='fm' needs DEVICE_FILES['FM']")
+            if method != "rkky_nm":
+                nm = None
+
+        # Build key: every setting of the build, the input files, the builder source
+        entry = lambda k: files[k] if isinstance(files[k], dict) else str(files[k])
+        input_files = [data["PRISTINE_FILE"]]
+        if needs_single:
+            input_files += [e["file"] if isinstance(e, dict) else e
+                            for e in (entry(defect_i), entry(defect_j))]
+        input_files += [f for f in (fm, nm) if f]
+        settings = dict(builder=builder_name, method=method, basis=basis, align=align,
+                        n_dist=n_dist, defect_i=defect_i, defect_j=defect_j,
+                        defect_type=defect_type, adatom_species=adatom_species, Z=Z,
+                        downfold=downfold, region=region, radius=radius, vertices=vertices,
+                        vertex_source=vertex_source, N_imp=N_imp, N_buffer=N_buffer,
+                        builder_kwargs=sorted((k, repr(v)) for k, v in (builder_kwargs or {}).items()),
+                        defect_entries=[entry(k) for k in ((defect_i, defect_j) if needs_single else ())])
+        key = build_key(settings, input_files) if cache_static else None
+        common = dict(data=data, system_name=system_name, contour=contour,
+                      folder=str(folder_), results_name=name_)
+        if cache_static and not force_rebuild:
+            cached = load_build(cache_dir(folder_, name_), key, verbose=verbose)
+            if cached is not None:
+                return dict(common, obj=cached["obj"], H_0=cached["H_0"], eshift=cached["eshift"],
+                            specs=cached["specs"], builder=None, from_cache=True)
+
+        # 2. pristine Hamiltonian -> H_0 and electrodes
+        H_0, H_0_DFT, eshift = JD.prune_ham(data["PRISTINE_FILE"], basis=basis, align=align)
+        say(f"Pristine cell: {H_0.na} atoms, {H_0.no} orbitals (basis {basis}, align {align})")
+
+        # 3. defect specs: a file (detected automatically) or explicit indices (dict)
+        def spec(label):
+            if isinstance(files[label], dict):
+                return load_defects({label: files[label]})[label]
+            if defect_type == "adatom":
+                return auto_spec(label, files[label], "adatom", species=adatom_species)
+            return auto_spec(label, files[label], "heteroatom", Z=Z)
+
+        specs = (spec(defect_i), spec(defect_j)) if needs_single else ()
+
+        # 4. builder and build
+        extra = dict(builder_kwargs or {})
+        extra.setdefault("verbose", verbose)
+        if builder_name == "PristineTiled":
+            builder = PristineTiled(H_0, specs, n_dist, basis=basis, N_imp=N_imp, N_buffer=N_buffer,
+                                    region=region, radius=radius, downfold=downfold, **extra)
+        elif builder_name == "SuperpositionDyson":
+            builder = SuperpositionDyson(H_0, specs, n_dist, basis=basis, N_imp=N_imp,
+                                         N_buffer=N_buffer, region=region, radius=radius,
+                                         downfold=downfold, vertices=vertices, **extra)
+        else:
             builder = DFTDevice(fm, H_0, basis=basis, defect_type=defect_type,
-                                species=adatom_species, Z=Z,
-                                nm_file=nm if method == "rkky_nm" else None,
+                                species=adatom_species, Z=Z, nm_file=nm,
                                 vertex_source=vertex_source if method == "rkky_nm" else None,
                                 single_defects=specs or None, region=region, radius=radius,
                                 single_region=region if vertex_source == "single" else "all",
                                 **extra)
-        return dict(data=data, system_name=system_name, contour=contour, H_0=H_0,
-                    eshift=eshift, specs=specs, builder=builder)
+        obj = builder.build(method)
+        if cache_static:
+            path = save_build(cache_dir(folder_, name_), key,
+                              dict(obj=obj, H_0=H_0, eshift=eshift, specs=specs), method, save_deltas)
+            say(f"[build cache] built device saved to {path}", flush=True)
+        return dict(common, obj=obj, H_0=H_0, eshift=eshift, specs=specs, builder=builder,
+                    from_cache=False)
 
-    # Steps 1-4 on rank 0; an error there is raised on every rank (no deadlock)
+    # Steps 1-4 on rank 0 only; an error there is raised on every rank (no deadlock).
+    # The other ranks receive the built device by broadcast and read no file.
     if parallel:
         prep, error = None, None
         if rank == 0:
@@ -312,59 +369,19 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
             raise RuntimeError("run_exchange failed on rank 0:\n" + error)
         shared = comm.bcast(None if prep is None else
                             {k: v for k, v in prep.items() if k != "builder"}, root=0)
-        builder = prep["builder"] if rank == 0 else None
-        prep = dict(shared, builder=builder)
-        obj = build_on_root(builder, method, comm)        # built on rank 0, broadcast
+        prep = dict(shared, builder=prep["builder"] if rank == 0 else None)
     else:
         prep = prepare()
-        obj = prep["builder"].build(method)
+    obj = prep["obj"]
     data, contour, H_0 = prep["data"], prep["contour"], prep["H_0"]
-
-    folder = (Path(folder) if folder is not None
-              else Path(f"H_{prep['system_name']}_{basis}_{method}"))
-    results_name = results_name or _default_results_name(
-        method, defect_i, defect_j, n_dist, downfold, region, radius, vertices, vertex_source)
+    folder, results_name = Path(prep["folder"]), prep["results_name"]
     results_dir = folder / results_name
-    # BEGIN RESTART-SAFE CACHE V2
-    # BEGIN EXCHANGE STATIC CACHE
-    if cache_static:
-        cache_args = dict(
-            basis=basis, defect_i=defect_i, defect_j=defect_j,
-            n_dist=n_dist, downfold=downfold, region=region, radius=radius,
-            vertices=vertices, N_imp=N_imp, N_buffer=N_buffer,
-            axis=(builder_kwargs or {}).get("axis", 0),
-            save_deltas=save_deltas,
-        )
-        cache_error = None
-        if rank == 0:
-            try:
-                cache_path = cache_exchange_static(
-                    obj, method, folder, results_name, mode="auto", **cache_args)
-                say(f"Static vertices / H blocks: {cache_path}")
-            except Exception:
-                cache_error = traceback.format_exc()
-        if parallel:
-            cache_error = comm.bcast(cache_error, root=0)
-        if cache_error:
-            raise RuntimeError("Static exchange cache failed on rank 0:\n" + cache_error)
-        if parallel:
-            # Every rank must use the loaded static data; rank 0 alone writes.
-            local_error = None
-            if rank != 0:
-                try:
-                    cache_exchange_static(
-                        obj, method, folder, results_name, mode="read", **cache_args)
-                except Exception:
-                    local_error = traceback.format_exc()
-            errors = comm.allgather(local_error)
-            if any(error is not None for error in errors):
-                raise RuntimeError("Static exchange cache read failed:\n" +
-                                   "\n".join(e for e in errors if e is not None))
-    # END EXCHANGE STATIC CACHE
     if rank == 0:
         folder.mkdir(parents=True, exist_ok=True)
     if parallel:
         comm.Barrier()
+        threads = limit_blas_threads(comm, blas_threads)
+        say(f"BLAS threads per rank: {threads}")
 
     # 5. exchange (contour energies shared by all ranks)
     say(f"Computing {method} with {builder_name} on {comm.Get_size() if parallel else 1} rank(s) ...")
@@ -375,16 +392,22 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
             obj, method, contour["En"], contour["weights"], prefactor=prefactor,
             lead_eta=lead_eta, vertex_downfold=vertex_downfold, vertices=vertices,
             orbital_resolved=orbital_resolved, verbose=verbose,
-            comm=comm if parallel else None)
+            comm=comm if parallel else None, solver=solver, orbital_kernel=orbital_kernel)
     else:
         result = JD.calculate_exchange(
             **obj.exchange_kwargs(method), prefactor=prefactor, energies=contour["En"],
             contour_weights=contour["weights"], nk=nk, lead_eta=lead_eta,
-            orbital_resolved=orbital_resolved, verbose=False,
+            orbital_resolved=orbital_resolved, orbital_kernel=orbital_kernel, verbose=False,
             self_energy_mode=self_energy_mode,
             calculation_folder=folder if cached else None,
             results_name=results_name if cached else None,
             write_results=cached, mpi=parallel)
+    curves = None
+    if dos_energies is not None:            # DOS with all ranks (energies distributed)
+        say(f"DOS: {len(np.atleast_1d(dos_energies))} energies on "
+            f"{comm.Get_size() if parallel else 1} rank(s) ...")
+        curves = dos_curves(obj, method, builder_name, dos_energies, eta=dos_eta,
+                            orbitals=dos_orbitals, comm=comm if parallel else None, solver=solver)
     if rank != 0:
         return None
     say(f"J = {result.J_meV:.6f} meV")
@@ -396,7 +419,9 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                   radius=radius, vertices=vertices, vertex_source=vertex_source,
                   vertex_downfold=vertex_downfold, prefactor=prefactor, align=align,
                   N_imp=N_imp, N_buffer=N_buffer, nk=list(nk), lead_eta=lead_eta,
-                  self_energy_mode=self_energy_mode, cache_static=bool(cache_static), contour=contour["source"],
+                  self_energy_mode=self_energy_mode, cache_static=bool(cache_static),
+                  build_from_cache=bool(prep.get("from_cache", False)), solver=solver,
+                  orbital_kernel=orbital_kernel, contour=contour["source"],
                   mpi_ranks=comm.Get_size() if parallel else 1,
                   pristine_file=str(data["PRISTINE_FILE"]),
                   defect_files={k: (files[k] if isinstance(files[k], dict) else str(files[k]))
@@ -405,10 +430,18 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                   J_meV=float(result.J_meV), anchor_distance=float(obj.anchor_distance),
                   distance=float(obj.distance),
                   date=datetime.datetime.now().isoformat(timespec="seconds"))
+    if curves is not None:
+        config.update(dos_eta=dos_eta, dos_orbitals=(dos_orbitals if isinstance(dos_orbitals, (str, type(None)))
+                                                     else "indices"),
+                      dos_n_energies=len(np.atleast_1d(dos_energies)))
     run = ExchangeRun(method, config, result, results_dir, obj, prep["builder"], H_0, contour,
                       prep["specs"], info=dict(pristine_eshift=prep["eshift"]))
+    run.dos = curves
     if write_results:
         _save(run, cached)
+        if curves is not None:
+            save_dos(results_dir / "dos.npz", curves,
+                     meta=dict(method=method, eta=dos_eta, orbitals=config["dos_orbitals"]))
         say(f"Results written to {results_dir}")
     return run
 
@@ -444,6 +477,63 @@ def _save(run: ExchangeRun, cached: bool) -> None:
         method=run.method, basis=run.config["basis"])
     geom.write(str(d / "device.fdf"))
     (d / "run_config.json").write_text(json.dumps(run.config, indent=2))
+
+
+def dos_curves(obj, method: str, builder_name: str, energies, eta: float = 0.01,
+               orbitals="region", comm=None, solver: str = "sparse") -> Optional[dict]:
+    """DOS of the reference of `method` and its comparison curve (rank 0; others None).
+
+    rkky                         pristine device
+    rkky_sup, liechtenstein_sup  defect region R, compared with the pristine host on R
+    rkky_nm                      NM device, compared with the FM device (if available)
+    liechtenstein                FM device, spin up and down
+    orbitals: device builders, None (total DOS), 'region' (defect regions) or indices.
+    With comm the energies are distributed over the ranks.
+    """
+    from Device_Builder import compute_dos
+    E = np.asarray(energies, dtype=float)
+    kw = dict(eta=eta, comm=comm, solver=solver)
+    if builder_name != "SuperpositionDyson":
+        kw["orbitals"] = orbitals
+    wanted = [(method, method)]
+    if builder_name == "SuperpositionDyson":
+        wanted.append(("pristine host (same region)", "rkky"))
+    if method == "rkky_nm" and "liechtenstein" in getattr(obj, "methods", ()):
+        wanted.append(("FM device", "liechtenstein"))
+    curves = {label: compute_dos(obj, m, E, **kw) for label, m in wanted}
+    if comm is not None and comm.Get_rank() != 0:
+        return None
+    return curves
+
+
+def save_dos(path, curves: dict, meta: Optional[dict] = None) -> None:
+    """Write DOS curves to an .npz file (no pickle)."""
+    names = list(curves)
+    data = {"names": np.asarray(names, dtype="U64"),
+            "energies": np.asarray(next(iter(curves.values()))["energies"])}
+    for k, name in enumerate(names):
+        data[f"dos_{k}"] = np.asarray(curves[name]["dos"])
+        data[f"spins_{k}"] = np.asarray(curves[name]["spins"], dtype="U8")
+        data[f"n_orbitals_{k}"] = np.asarray(len(curves[name].get("orbitals", ())))
+    if meta:
+        data["meta"] = np.asarray(json.dumps(meta))
+    np.savez_compressed(path, **data)
+
+
+def load_dos(results_dir) -> Optional[dict]:
+    """DOS curves saved by run_exchange(dos_energies=...), or None."""
+    f = Path(results_dir) / "dos.npz"
+    if not f.is_file():
+        return None
+    with np.load(f, allow_pickle=False) as z:
+        E = z["energies"].copy()
+        out = {}
+        for k, name in enumerate(z["names"]):
+            out[str(name)] = dict(energies=E, dos=z[f"dos_{k}"].copy(),
+                                  spins=tuple(str(x) for x in z[f"spins_{k}"]))
+        if "meta" in z.files:
+            out["_meta"] = json.loads(str(z["meta"].item()))
+    return out
 
 
 def load_results(results_dir):

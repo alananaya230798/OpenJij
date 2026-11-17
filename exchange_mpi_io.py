@@ -37,6 +37,36 @@ def _atomic_npz(path, **data):
     os.replace(tmp, path)
 
 
+def limit_blas_threads(comm=None, threads="auto"):
+    """Limit the BLAS/OpenMP threads of this MPI rank (returns the number or a note).
+
+    Without a limit, every rank starts as many BLAS threads as the node has cores:
+    8 ranks on 8 cores then run ~64 threads that compete for the cores, which can
+    make an MPI run slower than a single rank. threads='auto' uses
+    (cores available to this rank) / (ranks on this node), at least 1; an integer
+    sets it; None leaves the threads alone. Needs threadpoolctl; otherwise set
+    OMP_NUM_THREADS, OPENBLAS_NUM_THREADS and MKL_NUM_THREADS in the job script.
+    """
+    if threads is None:
+        return "unchanged"
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        return ("unchanged (threadpoolctl not installed: export OMP_NUM_THREADS=1 "
+                "OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 in the job script)")
+    if threads == "auto":
+        cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+        local = 1
+        if comm is not None:
+            from mpi4py import MPI
+            node = comm.Split_type(MPI.COMM_TYPE_SHARED)
+            local = node.Get_size()
+            node.Free()
+        threads = max(1, cores // local) if cores > local else 1
+    threadpool_limits(limits=int(threads))
+    return int(threads)
+
+
 def save_local_delta(filename, Delta, orbitals, **metadata):
     """Write a compact CSR Delta without object arrays/pickle."""
     path = Path(filename)

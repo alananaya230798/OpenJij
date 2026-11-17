@@ -52,6 +52,19 @@ def parse(argv=None):
     p.add_argument("--vertex-downfold", default="linear", choices=("linear", "full"))
     p.add_argument("--prefactor", type=float, default=None)
     p.add_argument("--self-energy-mode", default="compute", choices=("compute", "compute+write", "read"))
+    p.add_argument("--solver", default="sparse", choices=("sparse", "dyson"),
+                   help="Dyson methods: sparse LU (default) or dense Dyson (reference)")
+    p.add_argument("--orbital-kernel", default="classes", choices=("classes", "full", "none"),
+                   help="per-energy orbital output (default classes; full is large)")
+    p.add_argument("--no-cache", action="store_true", help="do not use the build cache")
+    p.add_argument("--force-rebuild", action="store_true", help="rebuild and rewrite the build cache")
+    p.add_argument("--blas-threads", default="auto",
+                   help="BLAS threads per MPI rank: auto, an integer, or keep")
+    p.add_argument("--dos", nargs=3, type=float, metavar=("EMIN", "EMAX", "N"), default=None,
+                   help="also compute the DOS on N energies in [EMIN, EMAX] (eV), with all ranks")
+    p.add_argument("--dos-eta", type=float, default=0.01, help="DOS broadening (eV)")
+    p.add_argument("--dos-total", action="store_true",
+                   help="total device DOS instead of the defect regions (device builders)")
     p.add_argument("--serial", action="store_true", help="do not use MPI")
     return p.parse_args(argv)
 
@@ -75,7 +88,14 @@ def main(argv=None):
                        downfold=a.downfold, region=a.region, radius=a.radius,
                        vertices=a.vertices, vertex_source=a.vertex_source,
                        vertex_downfold=a.vertex_downfold, prefactor=a.prefactor,
-                       self_energy_mode=a.self_energy_mode, comm=comm)
+                       self_energy_mode=a.self_energy_mode, comm=comm,
+                       solver=a.solver, orbital_kernel=a.orbital_kernel,
+                       cache_static=not a.no_cache, force_rebuild=a.force_rebuild,
+                       blas_threads=(None if a.blas_threads == "keep" else
+                                     int(a.blas_threads) if a.blas_threads.isdigit() else "auto"),
+                       dos_energies=(None if a.dos is None else
+                                     __import__("numpy").linspace(a.dos[0], a.dos[1], int(a.dos[2]))),
+                       dos_eta=a.dos_eta, dos_orbitals=None if a.dos_total else "region")
     if run is not None:
         print(run.summary(), flush=True)
         print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  done", flush=True)
