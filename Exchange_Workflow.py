@@ -123,6 +123,8 @@ def _default_results_name(method, defect_i, defect_j, n_dist, downfold, region, 
     name = f"Results_{defect_i}_{defect_j}_n{n_dist}"
     if region == "radius":
         name += f"_R{radius:.2f}"
+    elif region == "square":
+        name += f"_Sq{radius:.2f}"
     if method == "liechtenstein_sup":
         name += f"_{vertices}"
     if method == "rkky_nm" and vertex_source == "single":
@@ -216,7 +218,8 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     adatom_species / defect_type / Z : how the defects are found in the files
     downfold        : fold the adatoms (rkky, rkky_sup, liechtenstein_sup only)
     region, radius  : vertex region; default 'all' for the single-defect methods,
-                      'radius' for the DFT methods
+                      'radius' for the DFT methods. 'square' selects an xy
+                      square centred on each anchor, radius = half-side (Ang).
     vertices        : liechtenstein_sup: 'own' (default) or 'region'
     vertex_source   : rkky_nm: 'fm' (default) or 'single'
     vertex_downfold : rkky_sup with downfold: 'linear' (default) or 'full'

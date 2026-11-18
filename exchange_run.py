@@ -45,7 +45,7 @@ def parse(argv=None):
     p.add_argument("--defect-type", default="adatom", choices=("adatom", "heteroatom"))
     p.add_argument("--Z", default="5", help="heteroatom species (Z or symbol)")
     p.add_argument("--downfold", action="store_true", help="fold the adatoms (rkky, rkky_sup, liechtenstein_sup)")
-    p.add_argument("--region", default=None, choices=("all", "radius"))
+    p.add_argument("--region", default=None, choices=("all", "radius", "square"))
     p.add_argument("--radius", type=float, default=7.5)
     p.add_argument("--vertices", default="own", choices=("own", "region"))
     p.add_argument("--vertex-source", default=None, choices=("fm", "single"))

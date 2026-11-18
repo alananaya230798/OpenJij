@@ -1,0 +1,70 @@
+
+
+SolutionMethod        Diagon
+
+SystemName  Elec
+SystemLabel Elec
+
+==================================================
+==================================================
+# for spin polarized Calculations
+
+Spin polarized
+
+ElectronicTemperature 50 K
+Mesh.Cutoff 400 Ry
+
+==================================================
+==================================================
+# Details about DFT
+
+PAO.BasisSize   SZP
+XC.functional   GGA
+XC.authors      PBE
+
+==================================================
+==================================================
+# K-points
+
+%block kgrid_Monkhorst_Pack
+ 100    0      0      0.0
+ 0      1      0      0.0
+ 0      0      1      0.0
+%endblock kgrid_Monkhorst_Pack
+
+==================================================
+==================================================
+
+# Structure
+ 
+%include Elec.fdf #Change to desired structure
+
+==================================================
+==================================================
+
+# SCF variables
+
+DM.MixSCF1   T
+MaxSCFIterations      500           # Maximum number of SCF iter
+DM.MixingWeight       0.05          # New DM amount for next SCF cycle
+DM.Tolerance          1.d-4         # Tolerance in maximum difference
+DM.UseSaveDM          true          # to use continuation files
+DM.NumberPulay        5
+
+==================================================
+==================================================
+# MD variables
+# Output variables
+
+WriteMullikenPop                1
+WriteBands                      .false.
+SaveRho                         .true.
+SaveDeltaRho                    .false.
+SaveHS                          .true.
+SaveElectrostaticPotential      .false. 
+SaveTotalPotential              no
+WriteCoorXmol                   .false.
+WriteMDXmol                     .false.
+WriteMDhistory                  .false.
+WriteEigenvalues                .false.
+

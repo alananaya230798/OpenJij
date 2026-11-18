@@ -324,6 +324,19 @@ def map_spin_to_host(
             orbital_map[int(a)] = int(b)
     return atom_map, orbital_map
 
+def _square_region_atoms(xyz, anchor, half_side):
+    """Atom indices inside an axis-aligned xy square centred on anchor.
+
+    ``half_side`` is the distance from the centre to each edge, in angstrom.
+    All z coordinates are ignored (works for planar sheets with adatoms).
+    """
+    if half_side is None or half_side <= 0:
+        raise ValueError("radius (square half-side) must be positive in Angstrom")
+    xyz = np.asarray(xyz)
+    delta_xy = np.abs(xyz[:, :2] - xyz[int(anchor), :2])
+    return np.flatnonzero(np.all(delta_xy <= half_side, axis=1))
+
+
 def extract_single_Delta(
     H_host,
     H_polarized_file,
@@ -339,7 +352,7 @@ def extract_single_Delta(
     calculation_folder=None,
     keep_orbitals=(),        # NEW: retained adatom atoms (original indices)
     extra_basis="s",         # NEW: orbital label for listed adatoms
-    radius=3.5,             # NEW: Angstrom; used for region='radius'
+    radius=3.5,             # Angstrom; radius or square half-side
     atom_mask=None,         # NEW: original SP atom indices for region='atom_mask'
 ):
     """
@@ -349,6 +362,7 @@ def extract_single_Delta(
     Magnetic region options:
         'all'       : all orbitals of the prepared SP Hamiltonian
         'radius'    : orbitals on atoms within radius of defect_anchor
+        'square'    : atoms inside xy square centred on defect_anchor
         'atom_mask' : orbitals on original SP atoms listed in atom_mask
 
     keep_orbitals and adatom_atoms use ORIGINAL SP atom indices.
@@ -356,8 +370,8 @@ def extract_single_Delta(
     bonded to H. The mask also uses ORIGINAL SP atom indices.
     """
     region = region.lower()
-    if region not in ("all", "radius", "atom_mask"):
-        raise ValueError("region must be 'all', 'radius', or 'atom_mask'")
+    if region not in ("all", "radius", "square", "atom_mask"):
+        raise ValueError("region must be 'all', 'radius', 'square', or 'atom_mask'")
 
     # 1. Read the spin-polarized Hamiltonian
     H_sp = sisl.get_sile(H_polarized_file).read_hamiltonian()
@@ -407,6 +421,8 @@ def extract_single_Delta(
         xyz = np.asarray(H_def.geometry.xyz)
         dist = np.linalg.norm(xyz - xyz[defect_anchor_new], axis=1)
         selected_atoms = np.flatnonzero(dist <= radius)
+    elif region == "square":
+        selected_atoms = _square_region_atoms(H_def.geometry.xyz, defect_anchor_new, radius)
     else:  # region == 'atom_mask'
         if atom_mask is None:
             raise ValueError("atom_mask must be provided for region='atom_mask'")
@@ -456,6 +472,8 @@ def extract_single_Delta(
     print(f"Region: {region}")
     if region == "radius":
         print(f"Radius: {radius:.3f} Angstrom")
+    elif region == "square":
+        print(f"Square half-side: {radius:.3f} Angstrom")
     print(f"Total defect atoms: {H_def.na}")
     print(f"Selected magnetic atoms: {len(selected_atoms)}")
     print(f"Selected orbitals: {len(orb_host)}")

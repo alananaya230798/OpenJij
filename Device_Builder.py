@@ -539,7 +539,8 @@ class PristineTiled:
                         anchor i in cell N_imp+N_buffer (current scripts).
     N_buffer  : extra pristine cells between defect supports and electrodes.
     n_tile    : electrode cells; None -> smallest with nsc <= 3.
-    region, radius, atom_mask : magnetic vertex region (extract_single_Delta).
+    region, radius, atom_mask : magnetic vertex region (extract_single_Delta);
+                 square uses radius as the xy half-side (angstrom).
     downfold  : True -> fold each H adatom into the carbons it couples to
                 (calculate_exchange(..., downfold=True)). Both defects must be
                 adatoms. The single-defect Hamiltonian is first shifted into the
@@ -717,6 +718,8 @@ class PristineTiled:
 
     # -- reports ---------------------------------------------------------------
     def _region_text(self) -> str:
+        if self.region == "square":
+            return f"square (half-side = {self.radius:.2f} Ang)"
         return self.region + (f" (R = {self.radius:.2f} Ang)" if self.region == "radius" else "")
 
     def _report_host(self, lay, H, device_anchors, dist, adist, left_orbs, right_orbs) -> None:
@@ -944,10 +947,12 @@ class Superposition(PristineTiled):
             vertex = set(embed)
         elif self.region == "radius":
             vertex = set(np.flatnonzero(dist <= self.radius).tolist())
+        elif self.region == "square":
+            vertex = set(JD._square_region_atoms(g.xyz, anchor, self.radius).tolist())
         elif self.region == "atom_mask":
             vertex = {pruned_index(orig, a) for a in np.atleast_1d(self.atom_mask)}
         else:
-            raise ValueError("region must be 'all', 'radius' or 'atom_mask'")
+            raise ValueError("region must be 'all', 'radius', 'square' or 'atom_mask'")
         outside = sorted(vertex - embed)
         if outside:
             raise ValueError(f"{spec.label}: vertex atoms {outside} are not embedded; "
@@ -1218,7 +1223,8 @@ def map_single_defect_vertex(spec, H_device, device_anchor: int, basis: str = "p
     adatom of the device (no downfolding).
 
     region       : 'all' (every atom of the single-defect file that lies in the
-                   device), 'radius' (sphere around the anchor) or 'atom_mask'
+                   device), 'radius' (sphere around the anchor), 'square'
+                   (xy square centred on anchor, radius = half-side), or 'atom_mask'
                    (atom indices of the FULL single-defect file).
     partner_atoms: device atoms of the OTHER defect; a species mismatch is
                    allowed only there (e.g. B of the partner on a carbon of
@@ -1241,10 +1247,12 @@ def map_single_defect_vertex(spec, H_device, device_anchor: int, basis: str = "p
         wanted = np.arange(g.na)
     elif region == "radius":
         wanted = np.flatnonzero(dist <= radius)
+    elif region == "square":
+        wanted = JD._square_region_atoms(g.xyz, anchor, radius)
     elif region == "atom_mask":
         wanted = np.array(sorted(pruned_index(orig, a) for a in np.atleast_1d(atom_mask)))
     else:
-        raise ValueError("region must be 'all', 'radius' or 'atom_mask'")
+        raise ValueError("region must be 'all', 'radius', 'square' or 'atom_mask'")
 
     gd = H_device.geometry
     shift = np.asarray(gd.xyz[device_anchor]) - np.asarray(g.xyz[anchor])
@@ -1362,8 +1370,8 @@ class DFTDevice:
                      vertex_source='single'.
     vertex_source  : 'fm' or 'single' (rkky_nm only); None -> 'fm' if `file`
                      is given, else 'single'.
-    region, radius, atom_mask : FM vertex region (device file): 'radius' or
-                     'atom_mask', disjoint for i and j.
+    region, radius, atom_mask : FM vertex region (device file): 'radius',
+                     'square' (xy half-side = radius) or 'atom_mask', disjoint for i and j.
     single_region, single_radius, single_atom_mask : vertex region for
                      vertex_source='single' (single-defect files); default
                      'all'; the two regions may overlap.
@@ -1588,7 +1596,9 @@ class DFTDevice:
         _report_electrode_regions(electrode, tails, self.ends_tol, self.overlap_tol,
                                   verbose=self.verbose)
         if self.verbose:
-            region = self.region + (f" (R = {self.radius:.2f} Ang)" if self.region == "radius" else "")
+            region = self.region + (f" (R = {self.radius:.2f} Ang)" if self.region == "radius"
+                                    else f" (half-side = {self.radius:.2f} Ang)" if self.region == "square"
+                                    else "")
             if "rkky_nm" in dev.vertex_sets and self.vertex_source == "single":
                 region += (f"; rkky_nm from single-defect files, region {self.single_region}"
                            + (f" (R = {self.single_radius:.2f} Ang)" if self.single_region == "radius" else ""))

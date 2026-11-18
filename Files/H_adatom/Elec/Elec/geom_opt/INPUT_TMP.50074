@@ -1,0 +1,52 @@
+SolutionMethod        Diagon
+Diag.Algorithm        ELPA
+SystemName  Elec
+SystemLabel Elec
+==================================================
+==================================================
+# Details about DFT
+PAO.BasisSize   SZP
+XC.functional   GGA
+XC.authors      PBE
+ElectronicTemperature 50 K
+Mesh.Cutoff 400 Ry
+==================================================
+==================================================
+# K-points
+%block kgrid_Monkhorst_Pack
+ 100    0      0      0.0
+ 0      1      0      0.0
+ 0      0      1      0.0
+%endblock kgrid_Monkhorst_Pack
+==================================================
+==================================================
+# Structure
+%include Elec.fdf #Change to desired structure
+===================================================
+===================================================
+# SCF variables
+DM.MixSCF1   T
+MaxSCFIterations      1000           # Maximum number of SCF iter
+SCF.DM.Tolerance 1.d-4
+SCF.H.Tolerance  1.d-3 eV
+DM.UseSaveDM          true          # to use continuation files
+# Structural optimization
+MD.TypeOfRun Broyden
+MD.Steps 300
+MD.MaxForceTol 0.01 eV/Ang
+MD.MaxCGDispl 0.2 Bohr
+MD.VariableCell False
+==================================================
+==================================================
+# Output variables
+WriteMullikenPop                0
+WriteBands                      .false.
+SaveRho                         .false.
+SaveDeltaRho                    .false.
+SaveHS                          .false.
+SaveElectrostaticPotential      .false.
+SaveTotalPotential              no
+WriteCoorXmol                   .true.
+WriteMDXmol                     .true.
+WriteMDhistory                  .false.
+WriteEigenvalues                no
