@@ -22,13 +22,14 @@ Methods (all from the SAME two single-defect calculations)
 'liechtenstein_sup' G_s = G_V,s, V_s = sum_d (V_d + s Delta_d / 2)
   (alias 'lkag_sup')
                     vertices='own' (default): own Delta of each single-defect
-                        file. Each defect's spin cloud rotates rigidly with its
-                        moment (cloud model); exact second derivative of the
-                        superposed state, also when the clouds overlap, so any
-                        region ('all', 'radius', 'atom_mask') is allowed.
+                        file inside its region.
                     vertices='region': total Delta of the superposed state in
                         each region (region model, as for a DFT two-defect
-                        device); the regions must be disjoint.
+                        device).
+                    For every method the regions are DISJOINT (region='disjoint'
+                    by default, see regions.py): overlapping clouds change |m| in
+                    the overlap, which breaks the force theorem and double counts
+                    sum_a Delta_i(a) m_j(a).
 In the weak-coupling limit liechtenstein_sup with vertices='own' tends to
 rkky_sup at every distance.
 
@@ -87,9 +88,10 @@ import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import splu
 
-from Device_Builder import (Superposition, _R0_blocks, _distances, _semi, _section, _close,
+from Device_Builder import (Superposition, _PlotMixin, _R0_blocks, _distances, _semi, _section, _close,
                             _max_abs, _report_vertices, _vertex_tails, _report_defect_electrodes)
 from defects_dependencies import pruned_index
+import regions as RG
 
 __all__ = ["SuperpositionDyson", "DysonSystem", "calculate_exchange_dyson",
            "dos_dyson", "DYSON_METHODS"]
@@ -160,7 +162,7 @@ class FoldedAdatom:
 # System
 # ===========================================================================
 @dataclass(eq=False)
-class DysonSystem:
+class DysonSystem(_PlotMixin):
     """Pristine device, electrodes and the superposed perturbation on R."""
     H: "object"                          # pristine tiled device (sisl, nonmagnetic)
     HamL: "object"
@@ -222,8 +224,10 @@ class SuperpositionDyson(Superposition):
     vertices : default vertex choice of 'liechtenstein_sup' ('own' or
                'region'); can be overridden in calculate_exchange_dyson.
 
-    Default region 'all' (inherited): each vertex is the whole single-defect
-    spin cloud, the natural choice of the cloud model (vertices='own').
+    Default region 'disjoint' (inherited): every atom belongs to one defect
+    ('dominant' own cloud by default, or 'nearest'), so the vertices never overlap.
+    With downfold the carbons coupled to each adatom must lie in its own region,
+    otherwise the build stops (the defects are too close for downfolding).
 
     build() returns a DysonSystem for calculate_exchange_dyson and dos_dyson;
     no method is chosen at build time.
@@ -236,6 +240,7 @@ class SuperpositionDyson(Superposition):
                  downfold: bool = False, **kwargs):
         super().__init__(H0, defects, n_dist, basis=basis, **kwargs)
         self.downfold = bool(downfold)
+        self.adatom_in_vertex = self.downfold      # removed (not in any vertex) otherwise
 
     def build(self, method: Optional[str] = None) -> DysonSystem:
         lay = self.layout()
@@ -252,8 +257,11 @@ class SuperpositionDyson(Superposition):
         support = np.zeros(n, dtype=int)
         per_defect, folded, shifts, rmss = [], [], [], []
 
+        ds = [self._prepare(spec, hg, a) for spec, a in zip(self.specs, host_anchors)]
+        protected = [self._coupled_host_atoms(d) for d in ds] if self.downfold else None
+        moment_report = self._finalize_vertices(ds, hg, host_anchors, protected)
         for k, (spec, h_anchor) in enumerate(zip(self.specs, host_anchors)):
-            d = self._prepare(spec, hg, h_anchor)
+            d = ds[k]
             Hd, gd = d["H"], d["H"].geometry
             H_mats, S_def = _R0_blocks(Hd)
             if (S_def is None) != (S_host is None):
@@ -378,6 +386,11 @@ class SuperpositionDyson(Superposition):
             own_v.append(own)
             tot_v.append(dH_diff_R[l][:, l].tocsr())
 
+        n_shared = int(np.intersect1d(loc[0], loc[1]).size)
+        if n_shared:
+            raise ValueError(f"The vertex regions of the two defects share {n_shared} orbitals "
+                             "(static part + downfolded carbons). Overlapping regions double "
+                             "count the exchange; use region='disjoint' or smaller regions.")
         resolved = tuple(p["d"]["r"] for p in per_defect)
         anchors = tuple(p["anchor"] for p in per_defect)
         dist, adist = _distances(hg, anchors, resolved)
@@ -389,8 +402,9 @@ class SuperpositionDyson(Superposition):
                       energy_shifts_eV=tuple(round(s, 6) for s in shifts),
                       align_rms_meV=tuple(round(1000 * r, 3) for r in rmss),
                       embedding_overlap_orbitals=overlap, delta_scale=lam,
-                      vertex_overlap_orbitals=int(np.intersect1d(loc[0], loc[1]).size),
-                      vertices=self.vertices))
+                      vertex_overlap_orbitals=0,
+                      vertices=self.vertices, region_moments_muB=moment_report,
+                      region_text=self._region_text()))
         data = [p["d"] for p in per_defect]
         tails = _vertex_tails({"own": (own_v, list(system.orbs)), "region": (tot_v, list(system.orbs))},
                               left, right)
@@ -407,6 +421,7 @@ class SuperpositionDyson(Superposition):
             print(f"Orbitals in R:      {len(R)} of {n} device orbitals")
             print(f"R in electrode cells: {np.intersect1d(R, np.union1d(left, right)).size} orbitals")
             print(f"Overlap correction: {'yes' if dS_R is not None else 'no (orthogonal basis)'}")
+            print("Mulliken moment per region:\n" + RG.format_moment_report(moment_report))
             _report_vertices(self._region_text() + " (static part)",
                              {"rkky_sup / own": (own_v, list(system.orbs)),
                               "region (total)": (tot_v, list(system.orbs))})
@@ -421,6 +436,7 @@ class SuperpositionDyson(Superposition):
                     print(f"{'':20s}H on-site (mean, host frame) up {h_up:+.3f} / down {h_dn:+.3f} eV")
             _close()
             print(system.summary(), flush=True)
+        self.built = system
         return system
 
 

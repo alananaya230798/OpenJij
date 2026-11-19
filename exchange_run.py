@@ -45,7 +45,13 @@ def parse(argv=None):
     p.add_argument("--defect-type", default="adatom", choices=("adatom", "heteroatom"))
     p.add_argument("--Z", default="5", help="heteroatom species (Z or symbol)")
     p.add_argument("--downfold", action="store_true", help="fold the adatoms (rkky, rkky_sup, liechtenstein_sup)")
-    p.add_argument("--region", default=None, choices=("all", "radius", "square"))
+    p.add_argument("--region", default=None, choices=("disjoint", "radius", "square"),
+                   help="vertex region (default disjoint; 'all' was removed)")
+    p.add_argument("--region-assign", default=None, choices=("dominant", "nearest"))
+    p.add_argument("--region-weight", default="delta", choices=("delta", "mulliken"))
+    p.add_argument("--region-wmin", type=float, default=1e-4)
+    p.add_argument("--region-rcut", type=float, default=None)
+    p.add_argument("--sparsity-atol", type=float, default=1e-6)
     p.add_argument("--radius", type=float, default=7.5)
     p.add_argument("--vertices", default="own", choices=("own", "region"))
     p.add_argument("--vertex-source", default=None, choices=("fm", "single"))
@@ -95,7 +101,10 @@ def main(argv=None):
                                      int(a.blas_threads) if a.blas_threads.isdigit() else "auto"),
                        dos_energies=(None if a.dos is None else
                                      __import__("numpy").linspace(a.dos[0], a.dos[1], int(a.dos[2]))),
-                       dos_eta=a.dos_eta, dos_orbitals=None if a.dos_total else "region")
+                       dos_eta=a.dos_eta, dos_orbitals=None if a.dos_total else "region",
+                       sparsity_atol=a.sparsity_atol, region_assign=a.region_assign,
+                       region_weight=a.region_weight, region_wmin=a.region_wmin,
+                       region_rcut=a.region_rcut)
     if run is not None:
         print(run.summary(), flush=True)
         print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  done", flush=True)

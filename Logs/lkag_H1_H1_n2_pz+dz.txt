@@ -1,0 +1,63 @@
+Traceback (most recent call last):
+  File "/home/Magnetic_Interactions/OpenJij/calc_Hadatom.py", line 225, in <module>
+Traceback (most recent call last):
+  File "/home/Magnetic_Interactions/OpenJij/calc_Hadatom.py", line 225, in <module>
+Traceback (most recent call last):
+  File "/home/Magnetic_Interactions/OpenJij/calc_Hadatom.py", line 225, in <module>
+Traceback (most recent call last):
+  File "/home/Magnetic_Interactions/OpenJij/calc_Hadatom.py", line 225, in <module>
+    main()
+    main()
+  File "/home/Magnetic_Interactions/OpenJij/calc_Hadatom.py", line 153, in main
+  File "/home/Magnetic_Interactions/OpenJij/calc_Hadatom.py", line 153, in main
+    if not file.is_file():
+           ^^^^^^^^^^^^^^
+    if not file.is_file():
+           ^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 894, in is_file
+  File "/usr/lib/python3.12/pathlib.py", line 894, in is_file
+    main()
+  File "/home/Magnetic_Interactions/OpenJij/calc_Hadatom.py", line 153, in main
+    if not file.is_file():
+    main()
+  File "/home/Magnetic_Interactions/OpenJij/calc_Hadatom.py", line 153, in main
+           ^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 894, in is_file
+    if not file.is_file():
+           ^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 894, in is_file
+    return S_ISREG(self.stat().st_mode)
+                   ^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 842, in stat
+    return os.stat(self, follow_symlinks=follow_symlinks)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 107] Transport endpoint is not connected: '/home/cluster_mount/J_GNRs/J_H1/n2/H1/FM/siesta_FM.fdf'
+    return S_ISREG(self.stat().st_mode)
+                   return S_ISREG(self.stat().st_mode)
+                   ^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 842, in stat
+    return os.stat(self, follow_symlinks=follow_symlinks)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 107] Transport endpoint is not connected: '/home/cluster_mount/J_GNRs/J_H1/n2/H1/FM/siesta_FM.fdf'
+    ^^^^^^^^^^^    return S_ISREG(self.stat().st_mode)
+                   ^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 842, in stat
+
+  File "/usr/lib/python3.12/pathlib.py", line 842, in stat
+    return os.stat(self, follow_symlinks=follow_symlinks)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 5] Input/output error: '/home/cluster_mount/J_GNRs/J_H1/n2/H1/FM/siesta_FM.fdf'
+    return os.stat(self, follow_symlinks=follow_symlinks)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionAbortedError: [Errno 103] Software caused connection abort: '/home/cluster_mount/J_GNRs/J_H1/n2/H1/FM/siesta_FM.fdf'
+--------------------------------------------------------------------------
+Primary job  terminated normally, but 1 process returned
+a non-zero exit code. Per user-direction, the job has been aborted.
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+mpirun detected that one or more processes exited with non-zero status, thus causing
+the job to be terminated. The first process to do so was:
+
+  Process name: [[16049,1],2]
+  Exit code:    1
+--------------------------------------------------------------------------

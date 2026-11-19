@@ -43,15 +43,21 @@ METHODS = {
 
 # Method
 METHOD = "rkky"              # rkky, rkky_sup, lkag_sup
-BASIS = "pz+dz"             # pz1, pz, pz+dz, all (as supported by your code)
+BASIS = "pz+dz"             # pz1, pz, pz+dz, full
 N_IMP = 5
 N_BUFFER = 1
 NK = (1, 0, 0)
 ALIGN = "vb"
 DOWNFOLD = True
 
-DFT_REGION = "radius"          # Must select nonoverlapping FM vertex regions
-DFT_RADIUS = 8.0               # Angstrom; converge this for lkag and rkky_nm
+# Vertex regions (all methods): disjoint, never overlapping
+REGION = "disjoint"            # disjoint (default), radius, square, atom_mask ('all' removed)
+REGION_ASSIGN = None           # None -> 'dominant' (rkky, rkky_sup, lkag_sup) / 'nearest' (DFT devices)
+REGION_WEIGHT = "delta"        # 'delta' (||H_up-H_dn|| per atom, eV) or 'mulliken' (|m_a|, muB)
+REGION_WMIN = 1e-4             # threshold on the weight (eV or muB)
+REGION_RCUT = None             # Angstrom from the defect centre (None: no cutoff)
+DFT_RADIUS = 8.0               # only for REGION = 'radius' / 'square'
+SPARSITY_ATOL = 1e-6           # eliminate_zeros tolerance for every H/S read
 RKKY_NM_VERTEX_SOURCE = "fm"   # "fm" or "single"
 
 # Electrode
@@ -98,19 +104,20 @@ elif len(sys.argv) != 1:
 # Output
 IS_DFT_DEVICE = METHOD in ("rkky_nm", "lkag")
 EFFECTIVE_DOWNFOLD = DOWNFOLD and not IS_DFT_DEVICE
-REGION = DFT_REGION if IS_DFT_DEVICE else "all"
 
 folder = Path("Examples/HydrogenAdatomInGNR") / f"{BASIS}_{METHOD}"
 results_name = f"Results_{DEFECT_I}_{DEFECT_J}_n{N_DIST}"
+results_name += f"_{REGION}"
+if REGION in ("radius", "square"):
+    results_name += f"{DFT_RADIUS:.2f}"
 if IS_DFT_DEVICE:
-    results_name += f"_R{DFT_RADIUS:.2f}"
     if METHOD == "rkky_nm":
         results_name += f"_{RKKY_NM_VERTEX_SOURCE}"
 if EFFECTIVE_DOWNFOLD:
     results_name += "_downfold"
 
-SAVE_DOS = False                      # DOS computed with all MPI ranks inside run_exchange
-DOS_ENERGIES = np.linspace(-1,1,100)
+SAVE_DOS = True                      # DOS computed with all MPI ranks inside run_exchange
+DOS_ENERGIES = np.linspace(-0.25,25,50)
 SAVE_PDF = False
 PLOT_DPI = 200
 
@@ -181,6 +188,11 @@ def main():
         region=REGION,
         # for dft device
         radius=DFT_RADIUS,
+        region_assign=REGION_ASSIGN,
+        region_weight=REGION_WEIGHT,
+        region_wmin=REGION_WMIN,
+        region_rcut=REGION_RCUT,
+        sparsity_atol=SPARSITY_ATOL,
         # for rkky+nm 
         vertex_source=RKKY_NM_VERTEX_SOURCE if METHOD == "rkky_nm" else None,
         builder_kwargs={"axis": TRANSPORT_AXIS},
@@ -208,9 +220,9 @@ def main():
 
     # This function returns a data dict but creates a Matplotlib figure.
     #plot_orbital_contributions(run.results_dir)
-    #save_fig(plt.gcf(), "03_orbital_contributions", plot_dir)
-    #save_fig(plot_exchange_kernel(run.results_dir), "04_exchange_kernel", plot_dir)
-    #save_fig(plot_atomic_contributions(run.results_dir), "05_atomic_contributions", plot_dir)
+    save_fig(plt.gcf(), "03_orbital_contributions", plot_dir)
+    save_fig(plot_exchange_kernel(run.results_dir), "04_exchange_kernel", plot_dir)
+    save_fig(plot_atomic_contributions(run.results_dir), "05_atomic_contributions", plot_dir)
     if SAVE_DOS:
         fig, _curves = plot_dos(run)          # plots the curves computed in parallel
         save_fig(fig, "06_reference_DOS", plot_dir)

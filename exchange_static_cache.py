@@ -6,9 +6,6 @@ extraction and the downfolding blocks. This cache stores the BUILT object
 (Device or DysonSystem) together with the pruned pristine Hamiltonian, and on
 the next run loads it INSTEAD of building:
 
-    key found and equal  -> load folder/results_name/Static/build.pkl (no DFT file is read)
-    key missing/changed  -> build as usual, then write the cache
-
 The key contains every setting that changes the build, the fingerprints of the
 input files (path, size, modification time) and the hash of the builder source
 code. Re-running SIESTA, changing a setting or editing a builder module therefore
@@ -33,8 +30,8 @@ from typing import Optional
 import numpy as np
 from scipy import sparse
 
-SCHEMA = 3
-_SOURCES = ("Device_Builder", "Dyson_Exchange", "defects_dependencies", "J_dependencies")
+SCHEMA = 4
+_SOURCES = ("Device_Builder", "Dyson_Exchange", "defects_dependencies", "J_dependencies", "regions")
 
 
 def _atomic_bytes(path: Path, data: bytes) -> None:

@@ -76,11 +76,13 @@ METHODS = {"rkky": "PristineTiled", "rkky_sup": "SuperpositionDyson",
            "liechtenstein_sup": "SuperpositionDyson", "rkky_nm": "DFTDevice",
            "liechtenstein": "DFTDevice"}
 # use one convention for everything. Here ....
-DEFAULT_PREFACTOR = {"rkky": -1.0 / np.pi, "rkky_sup": -1.0 / np.pi,
-                     "rkky_nm": -1.0 / np.pi, "liechtenstein": -1.0 /  np.pi,
-                     "liechtenstein_sup": -1.0 / np.pi }
-_DEFAULT_REGION = {"rkky": "all", "rkky_sup": "all", "liechtenstein_sup": "all",
-                   "rkky_nm": "radius", "liechtenstein": "radius"}
+DEFAULT_PREFACTOR = {"rkky": -1.0/(2*np.pi), "rkky_sup": -1.0/(2*np.pi),
+                     "rkky_nm": -1.0/(2*np.pi), "liechtenstein": -1.0/(2*np.pi),
+                     "liechtenstein_sup": -1.0 /(2*np.pi)}
+_DEFAULT_REGION = {"rkky": "disjoint", "rkky_sup": "disjoint", "liechtenstein_sup": "disjoint",
+                   "rkky_nm": "disjoint", "liechtenstein": "disjoint"}
+# Assignment rule of region='disjoint': single-defect builders 'dominant' (default) or
+# 'nearest'; the two-defect DFT devices only 'nearest'.
 
 
 # ===========================================================================
@@ -125,6 +127,8 @@ def _default_results_name(method, defect_i, defect_j, n_dist, downfold, region, 
         name += f"_R{radius:.2f}"
     elif region == "square":
         name += f"_Sq{radius:.2f}"
+    elif region == "disjoint":
+        name += f"_disjoint"
     if method == "liechtenstein_sup":
         name += f"_{vertices}"
     if method == "rkky_nm" and vertex_source == "single":
@@ -200,7 +204,10 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                  force_rebuild: bool = False, solver: str = "sparse",
                  orbital_kernel: str = "classes",
                  blas_threads="auto", dos_energies=None, dos_eta: float = 0.01,
-                 dos_orbitals="region") -> Optional[ExchangeRun]:
+                 dos_orbitals="region", sparsity_atol: Optional[float] = 1e-6,
+                 region_assign: Optional[str] = None, region_weight: str = "delta",
+                 region_wmin: float = 1e-4, region_rcut: Optional[float] = None,
+                 mulliken_column: int = 2) -> Optional[ExchangeRun]:
     """Compute J for one defect pair with any implemented method.
 
     method          : 'rkky', 'rkky_sup', 'liechtenstein_sup' ('lkag_sup'),
@@ -217,9 +224,19 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                       sizes the device automatically
     adatom_species / defect_type / Z : how the defects are found in the files
     downfold        : fold the adatoms (rkky, rkky_sup, liechtenstein_sup only)
-    region, radius  : vertex region; default 'all' for the single-defect methods,
-                      'radius' for the DFT methods. 'square' selects an xy
-                      square centred on each anchor, radius = half-side (Ang).
+    region, radius  : vertex region, default 'disjoint' for every method: each atom is
+                      assigned to one impurity (region_assign) and kept if its weight
+                      >= region_wmin and it lies within region_rcut of the centre.
+                      'radius' (sphere) / 'square' (xy half-side = radius, Ang) /
+                      'atom_mask' are still accepted but must not overlap.
+                      'all' was removed (overlapping vertices double count).
+    region_assign   : 'dominant' (larger own single-defect weight; default of rkky,
+                      rkky_sup, liechtenstein_sup) or 'nearest' (closest centre,
+                      Voronoi; the only rule of rkky_nm / liechtenstein).
+    region_weight   : 'delta' (||H_up - H_dn|| per atom, eV) or 'mulliken' (|m_a|, muB).
+    region_wmin, region_rcut : weight threshold and distance cutoff (Ang, None = none).
+    mulliken_column : spin column of read_charge('mulliken') in siesta.out; without an
+                      output file the moments come from the density matrix.
     vertices        : liechtenstein_sup: 'own' (default) or 'region'
     vertex_source   : rkky_nm: 'fm' (default) or 'single'
     vertex_downfold : rkky_sup with downfold: 'linear' (default) or 'full'
@@ -246,6 +263,9 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     dos_eta         : broadening of the DOS (eV).
     dos_orbitals    : device builders: 'region' (defect regions, default), None
                       (total device DOS) or device orbital indices.
+    sparsity_atol   : stored H/S elements with all components <= atol (eV for H) are
+                      removed when ANY DFT file is read (J_dependencies.read_hamiltonian);
+                      None keeps the matrices as read. Default 1e-6 (validated).
     """
     method = canonical_method(method)
     if method not in METHODS:
@@ -265,6 +285,7 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     def prepare():
         """Steps 1-4 (rank 0): inputs and contour; the built device from the cache
         (no DFT file read) or from pruning, defect specs and the builder."""
+        JD.set_sparsity_atol(sparsity_atol)
         data = load_inputs(inputs)
         system_name = data.get("system_name", "GNR")
         # 1. contour
@@ -308,6 +329,9 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                         defect_type=defect_type, adatom_species=adatom_species, Z=Z,
                         downfold=downfold, region=region, radius=radius, vertices=vertices,
                         vertex_source=vertex_source, N_imp=N_imp, N_buffer=N_buffer,
+                        sparsity_atol=sparsity_atol, region_assign=region_assign,
+                        region_weight=region_weight, region_wmin=region_wmin,
+                        region_rcut=region_rcut, mulliken_column=mulliken_column,
                         builder_kwargs=sorted((k, repr(v)) for k, v in (builder_kwargs or {}).items()),
                         defect_entries=[entry(k) for k in ((defect_i, defect_j) if needs_single else ())])
         key = build_key(settings, input_files) if cache_static else None
@@ -336,6 +360,13 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
         # 4. builder and build
         extra = dict(builder_kwargs or {})
         extra.setdefault("verbose", verbose)
+        extra.update(weight=region_weight, w_min=region_wmin, r_cut=region_rcut,
+                     mulliken_column=mulliken_column)
+        if builder_name == "DFTDevice":
+            if region_assign not in (None, "nearest"):
+                raise ValueError("The two-defect DFT devices only support region_assign='nearest'")
+        else:
+            extra["assign"] = region_assign or "dominant"
         if builder_name == "PristineTiled":
             builder = PristineTiled(H_0, specs, n_dist, basis=basis, N_imp=N_imp, N_buffer=N_buffer,
                                     region=region, radius=radius, downfold=downfold, **extra)
@@ -348,7 +379,7 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                                 species=adatom_species, Z=Z, nm_file=nm,
                                 vertex_source=vertex_source if method == "rkky_nm" else None,
                                 single_defects=specs or None, region=region, radius=radius,
-                                single_region=region if vertex_source == "single" else "all",
+                                single_region=region,
                                 **extra)
         obj = builder.build(method)
         if cache_static:
@@ -427,6 +458,8 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                   self_energy_mode=self_energy_mode, cache_static=bool(cache_static),
                   build_from_cache=bool(prep.get("from_cache", False)), solver=solver,
                   orbital_kernel=orbital_kernel, contour=contour["source"],
+                  sparsity_atol=sparsity_atol, region_assign=region_assign,
+                  region_weight=region_weight, region_wmin=region_wmin, region_rcut=region_rcut,
                   mpi_ranks=comm.Get_size() if parallel else 1,
                   pristine_file=str(data["PRISTINE_FILE"]),
                   defect_files={k: (files[k] if isinstance(files[k], dict) else str(files[k]))

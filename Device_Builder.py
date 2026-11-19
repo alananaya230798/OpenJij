@@ -52,6 +52,20 @@ DFTDevice  (methods 'liechtenstein', 'rkky_nm')
     explicit; no downfolding. With FM vertices the regions must be disjoint
     for both methods.
 
+Vertex regions (all builders)
+    region='disjoint' (default): every atom is assigned to one defect and kept if
+    significant (regions.py). Assignment 'dominant' (larger own single-defect
+    ||Delta|| or |m|; default of the single-defect builders) or 'nearest' (Voronoi;
+    the only rule of DFTDevice). Weight threshold w_min (eV for 'delta', muB for
+    'mulliken') and distance cutoff r_cut. 'radius', 'square' and 'atom_mask' remain,
+    but no builder accepts overlapping vertices. The Mulliken moment captured by
+    every region is reported (siesta.out, else the density matrix).
+    With downfolding, the carbons coupled to each adatom must belong to its own
+    region; otherwise the build stops.
+
+Sparsity: every DFT file is read through J_dependencies.read_hamiltonian, which
+removes stored elements with |H|, |S| <= SPARSITY_ATOL (1e-6 by default).
+
 compute_dos(obj, method, energies) gives the DOS for every builder.
 
 Host / electrode Hamiltonians may be nonmagnetic or spin polarized; a
@@ -74,6 +88,7 @@ from scipy.spatial import cKDTree
 
 from defects_dependencies import (Adatom, Heteroatom, ResolvedDefect, detect_adatoms,
                      detect_heteroatoms, keep_orbitals_for, pruned_index)
+import regions as RG
 
 __all__ = ["Device", "PristineTiled", "Superposition", "DFTDevice",
            "map_single_defect_vertex", "nonmagnetic", "electrode_tiling",
@@ -395,8 +410,39 @@ def _reindex(M, index, n):
 # ===========================================================================
 # Device
 # ===========================================================================
+
+class _PlotMixin:
+    """plot_setup / plot_vertices directly from a built object (Device, DysonSystem)."""
+
+    def plot_setup(self, method: Optional[str] = None, **kwargs):
+        """Device, vertex regions (with Mulliken moments), electrodes and anchors."""
+        from plot_dependencies import plot_setup
+        return plot_setup(self, method=method, **kwargs)
+
+    def plot_vertices(self, method: Optional[str] = None, **kwargs):
+        """Spin splitting of the two vertices, zoomed around the defects (window=10 Ang)."""
+        from plot_dependencies import plot_vertices
+        return plot_vertices(self, method=method, **kwargs)
+
+
+class _BuilderPlotMixin:
+    """The same plots from a builder, using its last build (builder.build(...) first)."""
+
+    def _last_build(self):
+        obj = getattr(self, "built", None)
+        if obj is None:
+            raise RuntimeError("Nothing built yet: call builder.build(method) first")
+        return obj
+
+    def plot_setup(self, method: Optional[str] = None, **kwargs):
+        return self._last_build().plot_setup(method=method, **kwargs)
+
+    def plot_vertices(self, method: Optional[str] = None, **kwargs):
+        return self._last_build().plot_vertices(method=method, **kwargs)
+
+
 @dataclass(eq=False)
-class Device:
+class Device(_PlotMixin):
     """Everything calculate_exchange needs for one defect pair."""
     kind: str
     methods: Tuple[str, ...]
@@ -526,7 +572,7 @@ def build_on_root(builder, method: str, comm=None) -> Device:
 # ===========================================================================
 # Pristine tiled host (RKKY)
 # ===========================================================================
-class PristineTiled:
+class PristineTiled(_BuilderPlotMixin):
     """Pristine host tiled along the transport axis; vertices from single defects.
 
     H0        : pruned, energy-aligned pristine cell (prune_ham output);
@@ -539,8 +585,18 @@ class PristineTiled:
                         anchor i in cell N_imp+N_buffer (current scripts).
     N_buffer  : extra pristine cells between defect supports and electrodes.
     n_tile    : electrode cells; None -> smallest with nsc <= 3.
-    region, radius, atom_mask : magnetic vertex region (extract_single_Delta);
-                 square uses radius as the xy half-side (angstrom).
+    region    : vertex region. 'disjoint' (default): every device atom is assigned to
+                one impurity (assign) and kept if its weight >= w_min and it lies within
+                r_cut of the centre (regions.py); 'radius' / 'square' (radius = sphere
+                radius / xy half-side, Ang) / 'atom_mask'. Overlapping regions are
+                rejected for every mode ('all' was removed: it double counts).
+    assign    : 'dominant' (default; larger own single-defect weight) or 'nearest'
+                (closest impurity centre, Voronoi).
+    weight    : 'delta' (||H_up - H_dn|| per atom, eV, default) or 'mulliken' (|m_a|, muB).
+    w_min, r_cut : weight threshold (eV or muB) and distance cutoff (Ang, None = none).
+    mulliken_column : spin column of read_charge('mulliken') in siesta.out.
+                The Mulliken moment captured by every region is always reported
+                (siesta.out next to the fdf, else the density matrix).
     downfold  : True -> fold each H adatom into the carbons it couples to
                 (calculate_exchange(..., downfold=True)). Both defects must be
                 adatoms. The single-defect Hamiltonian is first shifted into the
@@ -558,10 +614,12 @@ class PristineTiled:
     def __init__(self, H0, defects, n_dist: int, basis: str = "pz", axis: int = 0,
                  N_imp: Optional[int] = None, N_buffer: int = 1,
                  n_tile: Optional[int] = None, tol: float = 0.25,
-                 site_tol: float = 0.3, region: str = "all", radius: float = 3.5,
+                 site_tol: float = 0.3, region: str = "disjoint", radius: float = 3.5,
                  atom_mask=None, nm_tol: float = 1e-3, verbose: bool = True,
                  downfold: bool = False, align_radius: Optional[float] = None,
-                 ends_tol: float = 5*1e-3, overlap_tol: float = 1e-3):
+                 ends_tol: float = 5*1e-3, overlap_tol: float = 1e-3,
+                 assign: Optional[str] = None, weight: str = "delta", w_min: float = 1e-4,
+                 r_cut: Optional[float] = None, mulliken_column: int = 2):
         if len(defects) != 2:
             raise ValueError("defects must contain two specs (i, j)")
         if int(n_dist) < 0:
@@ -576,7 +634,14 @@ class PristineTiled:
         self.N_imp, self.N_buffer = N_imp, int(N_buffer)
         self.n_tile = electrode_tiling(self.H0, axis) if n_tile is None else int(n_tile)
         self.tol, self.site_tol = tol, site_tol
-        self.region, self.radius, self.atom_mask = region, radius, atom_mask
+        self.region, self.radius, self.atom_mask = RG.check_region(region), radius, atom_mask
+        self.assign = "dominant" if assign is None else str(assign)
+        if self.assign not in ("dominant", "nearest"):
+            raise ValueError("assign must be 'dominant' or 'nearest'")
+        if weight not in ("delta", "mulliken"):
+            raise ValueError("weight must be 'delta' or 'mulliken'")
+        self.weight, self.w_min, self.r_cut = weight, float(w_min), r_cut
+        self.mulliken_column = int(mulliken_column)
         self.nm_tol, self.verbose = nm_tol, verbose
         self.downfold, self.align_radius = bool(downfold), align_radius
         self.ends_tol, self.overlap_tol = ends_tol, overlap_tol
@@ -645,7 +710,7 @@ class PristineTiled:
         """
         JD = _JD()
         r = spec.resolve()
-        H_full = sisl.get_sile(str(spec.file)).read_hamiltonian()
+        H_full = _JD().read_hamiltonian(spec.file)
         # Pruned single-defect Hamiltonian without the adatom: mapping and alignment
         H_def, orig = JD.prepare_spin_basis(H_full, basis=self.basis,
                                             remove_atoms=tuple(spec.adatoms()))
@@ -720,7 +785,50 @@ class PristineTiled:
     def _region_text(self) -> str:
         if self.region == "square":
             return f"square (half-side = {self.radius:.2f} Ang)"
+        if self.region == "disjoint":
+            unit = "eV" if self.weight == "delta" else "muB"
+            return (f"disjoint ({self.assign}, weight {self.weight} >= {self.w_min:g} {unit}"
+                    + (f", r_cut {self.r_cut:.2f} Ang" if self.r_cut is not None else "") + ")")
         return self.region + (f" (R = {self.radius:.2f} Ang)" if self.region == "radius" else "")
+
+    # -- disjoint regions ----------------------------------------------------------
+    def _centres(self, geom, anchors):
+        return np.array([np.asarray(geom.xyz[a]) + r.center_offset
+                         for a, r in zip(anchors, (s.resolve() for s in self.specs))])
+
+    def _own_moments(self, spec, n_atoms):
+        m, src = RG.moments_or_none(spec.file, na=n_atoms, column=self.mulliken_column,
+                                    required=self.weight == "mulliken")
+        return np.asarray(m, dtype=float), src
+
+    def _disjoint(self, geom, anchors, clouds, protected=None):
+        """Disjoint regions on the device atoms from the own clouds of both defects.
+
+        clouds: per defect dict(dev=device atom of every cloud atom (-1 outside),
+                delta=||Delta|| per cloud atom, moment=Mulliken moment per cloud atom,
+                extra_moment=moment of atoms not on the device (e.g. a removed adatom))
+        Returns (regions in device atoms, labels, moment report).
+        """
+        na = geom.na
+        W = np.zeros((len(clouds), na))
+        M = np.zeros((len(clouds), na))
+        for k, c in enumerate(clouds):
+            ok = c["dev"] >= 0
+            w = c["delta"] if self.weight == "delta" else np.abs(c["moment"])
+            W[k, c["dev"][ok]] = w[ok]
+            M[k, c["dev"][ok]] = c["moment"][ok]
+        labels, kept = RG.partition(geom.xyz, self._centres(geom, anchors), W,
+                                    assign=self.assign, w_min=self.w_min, r_cut=self.r_cut,
+                                    protected=protected, names=[c["label"] for c in clouds])
+        rep = RG.region_moment_report(
+            {f"defect {'ij'[k]} ({c['label']}, {c['moment_source']})": M[k] for k, c in enumerate(clouds)},
+            kept)
+        for k, c in enumerate(clouds):      # moment of atoms not on the device (removed adatom)
+            name = list(rep)[k]
+            rep[name]["total"] += float(c.get("extra_moment", 0.0))
+            rep[name]["regions"][k] += float(c.get("extra_moment", 0.0))
+            rep[name]["off_device"] = float(c.get("extra_moment", 0.0))
+        return kept, labels, rep
 
     def _report_host(self, lay, H, device_anchors, dist, adist, left_orbs, right_orbs) -> None:
         """Pristine host, device layout and defect placement."""
@@ -760,6 +868,42 @@ class PristineTiled:
                   f"H on-site (mean) up {h_up:+.3f} / down {h_dn:+.3f} eV")
 
     # -- build ---------------------------------------------------------------
+    def _clouds(self, maps):
+        """Own clouds of the two single-defect files on the device (for regions/reports)."""
+        clouds = []
+        for spec, m in zip(self.specs, maps):
+            orig = np.asarray(m["orig"], dtype=int)
+            mom_all, src = self._own_moments(spec, m["H_full"].na)
+            removed = np.setdiff1d(np.arange(m["H_full"].na), orig)
+            clouds.append(dict(label=spec.label, dev=np.asarray(m["amap"], dtype=int),
+                               delta=RG.atom_delta_weights(m["H_def"]), moment=mom_all[orig],
+                               moment_source=src, orig=orig, file_total=float(mom_all.sum()),
+                               extra_moment=float(mom_all[removed].sum()) if removed.size else 0.0))
+        return clouds
+
+    def _region_report(self, geom, clouds, region_atoms, extra_in_region=None):
+        """Mulliken moment of every own cloud inside every (device-atom) region.
+
+        extra_in_region: count the moment of atoms that are not device atoms (the
+        adatom: removed, folded or explicit) in the defect's own region; default:
+        True if downfold."""
+        extra_in_region = self.downfold if extra_in_region is None else extra_in_region
+        M = []
+        for c in clouds:
+            v = np.zeros(geom.na)
+            ok = c["dev"] >= 0
+            v[c["dev"][ok]] = c["moment"][ok]
+            M.append(v)
+        rep = RG.region_moment_report(
+            {f"defect {'ij'[k]} ({c['label']}, {c['moment_source']})": M[k]
+             for k, c in enumerate(clouds)}, region_atoms)
+        for k, (name, c) in enumerate(zip(list(rep), clouds)):
+            rep[name]["off_device"] = c["extra_moment"]       # adatom (folded, explicit or dropped)
+            rep[name]["total"] = c.get("file_total", rep[name]["total"] + c["extra_moment"])
+            if extra_in_region:
+                rep[name]["regions"][k] += c["extra_moment"]  # adatom in its own vertex
+        return rep
+
     def build(self, method: str = "rkky") -> Device:
         method = canonical_method(method)
         if method not in self.methods:
@@ -768,22 +912,50 @@ class PristineTiled:
         JD = _JD()
         lay = self.layout()
         H, anchors = self._host(lay)
+        g = H.geometry
+        # Single-defect files on the device (alignment, supercell ends, clouds)
+        maps = [self._map_single(spec, H, a) for spec, a in zip(self.specs, anchors)]
+        data = None
+        protected = None
+        if self.downfold:
+            data = [self._downfold_data(spec, H, a, m)
+                    for spec, a, m in zip(self.specs, anchors, maps)]
+            protected = [np.unique(g.o2a(d[1])) for d in data]
+        clouds = self._clouds(maps)
+        if self.region == "disjoint":
+            kept, _, _ = self._disjoint(g, anchors, clouds, protected)
+            region_kw = []
+            for k, c in enumerate(clouds):
+                inv = {int(dv): a for a, dv in enumerate(c["dev"]) if dv >= 0}
+                mask = [int(c["orig"][inv[int(a)]]) for a in kept[k] if int(a) in inv]
+                if not mask:
+                    raise ValueError(f"{c['label']}: empty disjoint region; lower w_min")
+                region_kw.append(dict(region="atom_mask", atom_mask=mask))
+        else:
+            region_kw = [dict(region=self.region, radius=self.radius, atom_mask=self.atom_mask)] * 2
         Deltas, orbs = [], []
-        for spec, host_anchor in zip(self.specs, anchors):
+        for spec, host_anchor, kw in zip(self.specs, anchors, region_kw):
             D, orb, _ = JD.extract_single_Delta(
                 H_host=H, H_polarized_file=str(spec.file), host_anchor=host_anchor,
-                basis=self.basis, tol=self.tol, region=self.region,
-                radius=self.radius, atom_mask=self.atom_mask,
-                **spec.delta_kwargs("rkky"))
+                basis=self.basis, tol=self.tol, **kw, **spec.delta_kwargs("rkky"))
             Deltas.append(sparse.csr_matrix(D))
             orbs.append(np.asarray(orb, dtype=int))
+        # No method may use overlapping vertices (static part + downfolded carbons)
+        eff = [np.union1d(o, d[1]) if data else o for o, d in zip(orbs, data or [None, None])]
+        RG.check_disjoint(eff[0], eff[1], "rkky vertex")
+        if data:
+            for k in range(2):
+                RG.check_protected(np.unique(g.o2a(eff[k])), protected[k], self.specs[k].label,
+                                   other_atoms=np.unique(g.o2a(eff[1 - k])))
+        region_atoms = [np.unique(g.o2a(o)) for o in eff]
+        moment_report = self._region_report(g, clouds, region_atoms)
         HamL, HamR = self._electrodes()
         resolved = tuple(s.resolve() for s in self.specs)
         dist, adist = _distances(H.geometry, anchors, resolved)
         nl = HamL.no
-        info = dict(layout=tuple(lay.values()), n_dist=self.n_dist, downfold=self.downfold)
-        # Single-defect files on the device: supercell-end check and (optional) downfolding
-        maps = [self._map_single(spec, H, a) for spec, a in zip(self.specs, anchors)]
+        info = dict(layout=tuple(lay.values()), n_dist=self.n_dist, downfold=self.downfold,
+                    built_method=method, region_text=self._region_text())
+        # Supercell-end check of the single-defect files
         host_mats, S_host = _R0_blocks(H)
         cell_length = float(np.linalg.norm(self.H0.cell[self.axis]))
         elec_atoms = self._electrode_atoms(lay)
@@ -794,9 +966,8 @@ class PristineTiled:
         info["ends_max_splitting_meV"] = tuple(
             (round(1000 * e["left"]["spin"], 3), round(1000 * e["right"]["spin"], 3)) for e in ends)
         downfold_kwargs = {}
+        info["region_moments_muB"] = moment_report
         if self.downfold:
-            data = [self._downfold_data(spec, H, a, m)
-                    for spec, a, m in zip(self.specs, anchors, maps)]
             downfold_kwargs = dict(downfold=True,
                                    hydrogen_i=data[0][0], hydrogen_j=data[1][0],
                                    mapped_c_orbs_i=data[0][1], mapped_c_orbs_j=data[1][1])
@@ -814,10 +985,12 @@ class PristineTiled:
             self._report_host(lay, H, anchors, dist, adist, dev.left_orbs, dev.right_orbs)
             _report_defect_electrodes(entries, tails, self.ends_tol, self.overlap_tol)
             _report_vertices(self._region_text(), {"rkky": (Deltas, orbs)})
+            print("Mulliken moment per region:\n" + RG.format_moment_report(moment_report))
             if self.downfold:
                 self._report_downfold([s.label for s in self.specs], data)
             _close()
             print(dev.summary(), flush=True)
+        self.built = dev
         return dev
 
 
@@ -838,7 +1011,9 @@ class Superposition(PristineTiled):
                    align='far'; None -> farthest half of the mapped atoms.
     delta_scale  : multiplies every Delta (device and vertices); 1e-3 gives
                    the weak-coupling limit (LKAG -> RKKY check).
-    region, radius, atom_mask : vertex region (must lie inside the embedding).
+    region, radius, atom_mask, assign, weight, w_min, r_cut : vertex region (see
+                   PristineTiled; 'disjoint' by default). Regions must lie inside the
+                   embedding and may not overlap.
     vertices     : vertices of 'liechtenstein_sup':
                    'own'    (default) OWN splitting of each single-defect file:
                             each defect's spin cloud rotates rigidly with its
@@ -883,7 +1058,7 @@ class Superposition(PristineTiled):
         """Prune, map, align one defect; return a dict of local data."""
         JD = _JD()
         r = spec.resolve()
-        H_full = sisl.get_sile(str(spec.file)).read_hamiltonian()
+        H_full = _JD().read_hamiltonian(spec.file)
         if not H_full.spin.is_polarized:
             warnings.warn(f"{spec.label}: unpolarized defect Hamiltonian, Delta = 0")
         keep = spec.adatoms()
@@ -943,8 +1118,8 @@ class Superposition(PristineTiled):
                                  "fall outside the device; enlarge the device")
             embed = inside
         embed |= set(adatoms)
-        if self.region == "all":
-            vertex = set(embed)
+        if self.region == "disjoint":
+            vertex = None                 # set by _finalize_vertices (needs both defects)
         elif self.region == "radius":
             vertex = set(np.flatnonzero(dist <= self.radius).tolist())
         elif self.region == "square":
@@ -952,17 +1127,79 @@ class Superposition(PristineTiled):
         elif self.region == "atom_mask":
             vertex = {pruned_index(orig, a) for a in np.atleast_1d(self.atom_mask)}
         else:
-            raise ValueError("region must be 'all', 'radius', 'square' or 'atom_mask'")
-        outside = sorted(vertex - embed)
+            raise ValueError(RG.REMOVED_ALL if self.region == "all" else
+                             f"region must be one of {RG.REGION_MODES}")
+        outside = sorted(vertex - embed) if vertex is not None else []
         if outside:
             raise ValueError(f"{spec.label}: vertex atoms {outside} are not embedded; "
                              "increase embed_radius or reduce the vertex region")
-        return dict(spec=spec, r=r, H=H_def, orig=orig, anchor=anchor, amap=amap,
+        return dict(spec=spec, r=r, H=H_def, orig=orig, anchor=anchor, amap=amap, n_full=H_full.na,
                     adatoms=adatoms, ad_xyz=ad_xyz, embed=embed, vertex=vertex,
                     dist=dist, mapped=mapped, shift_xy=shift,
                     map_stats=dict(n_atoms=g.na, n_mapped=len(mapped),
                                    n_outside=int(np.sum(amap < 0)) - len(adatoms),
                                    max_mismatch=float(mismatch.max()) if len(mismatch) else 0.0))
+
+    # -- vertices of both defects ------------------------------------------------
+    def _sup_clouds(self, data):
+        """Own clouds (pruned single-defect atoms -> host atoms) of the prepared defects."""
+        clouds = []
+        for d in data:
+            spec = d["spec"]
+            mom_all, src = RG.moments_or_none(spec.file, na=d["n_full"], column=self.mulliken_column,
+                                              required=self.weight == "mulliken")
+            orig = np.asarray(d["orig"], dtype=int)
+            dev = np.asarray(d["amap"], dtype=int).copy()
+            outside = np.array([a not in d["embed"] for a in range(len(dev))])
+            dev[outside] = -1
+            ad = [int(pruned_index(orig, a)) for a in spec.adatoms()]
+            mom = mom_all[orig]
+            clouds.append(dict(label=spec.label, dev=dev, delta=RG.atom_delta_weights(d["H"]),
+                               moment=mom, moment_source=src, orig=orig, file_total=float(mom_all.sum()),
+                               extra_moment=float(mom[ad].sum()) if ad else 0.0))
+        return clouds
+
+    @staticmethod
+    def _coupled_host_atoms(d):
+        """Host atoms of the heavy atoms coupled (H or S) to the adatoms of a prepared defect."""
+        Hd, gd = d["H"], d["H"].geometry
+        mats, S = _R0_blocks(Hd)
+        coupled = set()
+        for a in d["adatoms"]:
+            h = gd.a2o(a, all=True)
+            for M in list(mats) + ([S] if S is not None else []):
+                Mc = M.tocsr()
+                rows = np.unique(np.concatenate([Mc[:, h].nonzero()[0], Mc[h, :].nonzero()[1]]))
+                coupled.update(int(o) for o in rows)
+        heavy_atoms = {int(gd.o2a(o)) for o in coupled} - set(d["adatoms"])
+        host = [int(d["amap"][a]) for a in heavy_atoms if d["amap"][a] >= 0]
+        if len(host) != len(heavy_atoms):
+            raise ValueError(f"{d['spec'].label}: the adatom couples to atoms outside the device")
+        return np.array(sorted(host), dtype=int)
+
+    def _finalize_vertices(self, data, hg, host_anchors, protected=None):
+        """Disjoint vertex regions (region='disjoint') and the Mulliken report (any region)."""
+        clouds = self._sup_clouds(data)
+        if self.region == "disjoint":
+            kept, _, _ = self._disjoint(hg, host_anchors, clouds, protected)
+            for k, (d, c) in enumerate(zip(data, clouds)):
+                region = set(int(a) for a in kept[k])
+                d["vertex"] = {a for a in range(len(c["dev"])) if c["dev"][a] in region} \
+                    | set(d["adatoms"])
+                if not d["vertex"] - set(d["adatoms"]):
+                    raise ValueError(f"{c['label']}: empty disjoint region; lower w_min")
+        region_atoms = [np.array(sorted({int(d["amap"][a]) for a in d["vertex"] if d["amap"][a] >= 0}))
+                        for d in data]
+        if protected is not None:
+            for k in range(2):
+                RG.check_protected(region_atoms[k], protected[k], data[k]["spec"].label,
+                                   other_atoms=region_atoms[1 - k])
+        if np.intersect1d(region_atoms[0], region_atoms[1]).size:
+            RG.check_disjoint(region_atoms[0], region_atoms[1], "vertex (atoms)")
+        # adatom moment counted in its own vertex when the adatom is part of it
+        # (explicit in Superposition, folded with downfold in SuperpositionDyson)
+        in_vertex = getattr(self, "adatom_in_vertex", True)
+        return self._region_report(hg, clouds, region_atoms, extra_in_region=in_vertex)
 
     def _align_shift(self, d, H_host_mats, host_o2dev, def_o2dev, H_mats, S_def):
         """Energy shift of one defect Hamiltonian relative to the host (eV)."""
@@ -1048,6 +1285,7 @@ class Superposition(PristineTiled):
         Hhost, host_anchors = self._host(lay)
         hg = Hhost.geometry
         data = [self._prepare(s, hg, a) for s, a in zip(self.specs, host_anchors)]
+        moment_report = self._finalize_vertices(data, hg, host_anchors)
 
         # Device atom order: host atoms, each adatom right after its host atom
         inserts: Dict[int, List[Tuple[int, int]]] = {}
@@ -1147,6 +1385,7 @@ class Superposition(PristineTiled):
         if overlap:
             warnings.warn(f"Embedding regions overlap on {overlap} orbitals; the "
                           "perturbations are added there (superposition approximation)")
+        RG.check_disjoint(orbs[0], orbs[1], "superposition vertex")
 
         # Electrodes and interfaces (host cells, device indexing)
         HamL, HamR = self._electrodes()
@@ -1189,7 +1428,9 @@ class Superposition(PristineTiled):
                                align_rms_meV=tuple(round(1000 * r, 3) for r in rmss),
                                embedding_overlap_orbitals=overlap,
                                delta_scale=self.delta_scale,
-                               vertices=self.vertices),
+                               vertices=self.vertices,
+                               region_moments_muB=moment_report, built_method=method,
+                               region_text=self._region_text()),
                      nm_tol=self.nm_tol, vertex_sets=vertex_sets)
         tails = _vertex_tails({m: vertex_sets[m] for m in self.methods}, left_orbs, right_orbs)
         if not self.verbose:          # warnings also without the report
@@ -1202,8 +1443,10 @@ class Superposition(PristineTiled):
                 "inserted (explicit H)", tails=tails)
             _report_vertices(self._region_text() + f", liechtenstein_sup vertices='{self.vertices}'",
                              {m: vertex_sets[m] for m in self.methods})
+            print("Mulliken moment per region:\n" + RG.format_moment_report(moment_report))
             _close()
             print(dev.summary(), flush=True)
+        self.built = dev
         return dev
 
 
@@ -1211,9 +1454,9 @@ class Superposition(PristineTiled):
 # Single-defect vertices mapped onto a device
 # ===========================================================================
 def map_single_defect_vertex(spec, H_device, device_anchor: int, basis: str = "pz",
-                             region: str = "all", radius: float = 7.5, atom_mask=None,
+                             region: str = "disjoint", radius: float = 7.5, atom_mask=None,
                              tol: float = 0.25, partner_atoms=(), exclude_orbs=(),
-                             verbose: bool = True):
+                             verbose: bool = True, device_atoms=None, w_min: float = 0.0):
     """OWN Delta = H_up - H_down of one single-defect SP calculation, on a device.
 
     The single-defect Hamiltonian is pruned to `basis` keeping the adatom
@@ -1222,8 +1465,9 @@ def map_single_defect_vertex(spec, H_device, device_anchor: int, basis: str = "p
     heavy atoms by in-plane position, adatoms by 3D position onto the explicit
     adatom of the device (no downfolding).
 
-    region       : 'all' (every atom of the single-defect file that lies in the
-                   device), 'radius' (sphere around the anchor), 'square'
+    region       : 'disjoint' (the atoms of the single-defect file that land on
+                   `device_atoms`, the disjoint region of this defect on the device, and
+                   whose ||Delta|| >= w_min), 'radius' (sphere around the anchor), 'square'
                    (xy square centred on anchor, radius = half-side), or 'atom_mask'
                    (atom indices of the FULL single-defect file).
     partner_atoms: device atoms of the OTHER defect; a species mismatch is
@@ -1236,24 +1480,24 @@ def map_single_defect_vertex(spec, H_device, device_anchor: int, basis: str = "p
     """
     JD = _JD()
     r = spec.resolve()
-    H_full = sisl.get_sile(str(spec.file)).read_hamiltonian()
+    H_full = _JD().read_hamiltonian(spec.file)
     if not H_full.spin.is_polarized:
         raise ValueError(f"{spec.label}: single-defect file must be spin polarized")
     H_def, orig = JD.prepare_spin_basis(H_full, basis=basis, keep_orbitals=spec.adatoms())
     g = H_def.geometry
     anchor = pruned_index(orig, r.anchor)
     dist = np.linalg.norm(g.xyz - g.xyz[anchor], axis=1)
-    if region == "all":
-        wanted = np.arange(g.na)
+    region = RG.check_region(region)
+    if region == "disjoint":
+        if device_atoms is None:
+            raise ValueError("region='disjoint' needs device_atoms (the region on the device)")
+        wanted = np.arange(g.na)          # filtered after the mapping
     elif region == "radius":
         wanted = np.flatnonzero(dist <= radius)
     elif region == "square":
         wanted = JD._square_region_atoms(g.xyz, anchor, radius)
     elif region == "atom_mask":
         wanted = np.array(sorted(pruned_index(orig, a) for a in np.atleast_1d(atom_mask)))
-    else:
-        raise ValueError("region must be 'all', 'radius', 'square' or 'atom_mask'")
-
     gd = H_device.geometry
     shift = np.asarray(gd.xyz[device_anchor]) - np.asarray(g.xyz[anchor])
     Zd = np.asarray(gd.atoms.Z)
@@ -1299,9 +1543,17 @@ def map_single_defect_vertex(spec, H_device, device_anchor: int, basis: str = "p
     if missing_ad:
         raise ValueError(f"{spec.label}: adatom {missing_ad} has no partner in the device "
                          f"within {tol} Å (relaxation differences? increase tol)")
-    if unmapped and region != "all":
+    if unmapped and region != "disjoint":
         raise ValueError(f"{spec.label}: {len(unmapped)} vertex atoms are outside the "
                          f"device or not matched within {tol} Å: {unmapped[:10]}...")
+    if region == "disjoint":
+        allowed = set(int(a) for a in np.asarray(device_atoms, dtype=int))
+        w = RG.atom_delta_weights(H_def)
+        amap = {a: h for a, h in amap.items()
+                if h in allowed and (w[a] >= w_min or a in adatoms)}
+        missing_ad = sorted(adatoms - set(amap))
+        if missing_ad:
+            raise ValueError(f"{spec.label}: the adatom is outside its disjoint region")
 
     mats, _ = _R0_blocks(H_def)
     D = (mats[0] - mats[1]).tocsr()
@@ -1343,7 +1595,7 @@ def map_single_defect_vertex(spec, H_device, device_anchor: int, basis: str = "p
 # ===========================================================================
 # Two-defect DFT device
 # ===========================================================================
-class DFTDevice:
+class DFTDevice(_BuilderPlotMixin):
     """Two-defect DFT device, pruned and aligned to pristine electrodes.
 
     Propagators come from the two-defect DFT Hamiltonians:
@@ -1370,11 +1622,16 @@ class DFTDevice:
                      vertex_source='single'.
     vertex_source  : 'fm' or 'single' (rkky_nm only); None -> 'fm' if `file`
                      is given, else 'single'.
-    region, radius, atom_mask : FM vertex region (device file): 'radius',
-                     'square' (xy half-side = radius) or 'atom_mask', disjoint for i and j.
+    region, radius, atom_mask : FM vertex region (device file): 'disjoint' (default:
+                     every device atom goes to the NEAREST defect centre and is kept if
+                     its weight >= w_min and it lies within r_cut), 'radius', 'square'
+                     (xy half-side = radius) or 'atom_mask'; never overlapping.
+    weight, w_min, r_cut : weight of region='disjoint': 'delta' (||H_up - H_dn|| of the
+                     FM device per atom, eV) or 'mulliken' (|m_a| of the FM device, muB).
+    assign         : only 'nearest' (the own clouds are unknown in a two-defect device).
     single_region, single_radius, single_atom_mask : vertex region for
-                     vertex_source='single' (single-defect files); default
-                     'all'; the two regions may overlap.
+                     vertex_source='single' (single-defect files); default 'disjoint'
+                     (same nearest partition of the device); never overlapping.
     map_tol        : Angstrom, matching tolerance single-defect -> device
                      (the two relaxations differ slightly).
     ends_tol, overlap_tol : warnings when, in the electrode regions of the FM / NM
@@ -1389,13 +1646,23 @@ class DFTDevice:
                  z_thresh: float = 0.3, group_cutoff: float = 3.0,
                  nm_file=None, single_defects=None, axis: int = 0,
                  n_tile: Optional[int] = None, tol: float = 0.1,
-                 region: str = "radius", radius: float = 7.5, atom_mask=None,
-                 single_region: str = "all", single_radius: Optional[float] = None,
+                 region: str = "disjoint", radius: float = 7.5, atom_mask=None,
+                 single_region: str = "disjoint", single_radius: Optional[float] = None,
                  single_atom_mask=None, map_tol: float = 0.25,
                  align_tol: float = 0.2, max_offset_difference: float = 0.01,
                  geom_tol: float = 0.1, nm_tol: float = 1e-3, verbose: bool = True,
                  vertex_source: Optional[str] = None, ends_tol: float = 1e-3,
-                 overlap_tol: float = 1e-4):
+                 overlap_tol: float = 1e-4, assign: Optional[str] = None,
+                 weight: str = "delta", w_min: float = 1e-4, r_cut: Optional[float] = None,
+                 mulliken_column: int = 2):
+        if assign not in (None, "nearest"):
+            raise ValueError("DFTDevice only supports assign='nearest' (Voronoi): the own "
+                             "clouds of the two defects are not known in a two-defect device")
+        if weight not in ("delta", "mulliken"):
+            raise ValueError("weight must be 'delta' or 'mulliken'")
+        self.weight, self.w_min, self.r_cut = weight, float(w_min), r_cut
+        self.mulliken_column = int(mulliken_column)
+        region, single_region = RG.check_region(region), RG.check_region(single_region)
         if H0 is None:
             raise ValueError("H0 (pristine electrode cell) is required")
         if file is None and nm_file is None:
@@ -1459,7 +1726,7 @@ class DFTDevice:
     # -- helpers ----------------------------------------------------------------
     def _load(self, file, keep, HamL, label):
         JD = _JD()
-        H_full = sisl.get_sile(str(file)).read_hamiltonian()
+        H_full = _JD().read_hamiltonian(file)
         H_dev, orig = JD.prepare_spin_basis(H_full, basis=self.basis, keep_orbitals=keep)
         # align_defect_to_electrodes calls Hk(spin=...) on the electrode, which
         # recent sisl rejects for unpolarized matrices: give it a polarized copy.
@@ -1488,14 +1755,29 @@ class DFTDevice:
         defect_dev = [[pruned_index(orig, a) for a in r.defect_atoms] + [device.anchors[k]]
                       for k, r in enumerate(device.defects)]
         interfaces = np.union1d(device.left_orbs, device.right_orbs)
+        regions_dev = [None, None]
+        if RG.check_region(region) == "disjoint":
+            g = device.H_nm.geometry
+            regions_dev = self._nearest_regions(g, device.anchors, np.ones(g.na), w_min=0.0)
         Deltas, orbs, infos = [], [], []
         for k, one in enumerate(self.single_defects):
             D, o, inf = map_single_defect_vertex(
                 one, device.H_nm, device.anchors[k], basis=self.basis, region=region,
                 radius=radius, atom_mask=atom_mask, tol=self.map_tol,
-                partner_atoms=defect_dev[1 - k], exclude_orbs=interfaces, verbose=verbose)
+                partner_atoms=defect_dev[1 - k], exclude_orbs=interfaces, verbose=verbose,
+                device_atoms=regions_dev[k], w_min=self.w_min)
             Deltas.append(D); orbs.append(o); infos.append(inf)
+        RG.check_disjoint(orbs[0], orbs[1], "rkky_nm single-defect vertex")
         return Deltas, orbs, infos
+
+    def _nearest_regions(self, geom, anchors, weights, w_min=None):
+        """Voronoi (nearest centre) regions on the device atoms, with w_min and r_cut."""
+        centres = np.array([np.asarray(geom.xyz[a]) + r.center_offset
+                            for a, r in zip(anchors, (s.resolve() for s in self.specs))])
+        _, kept = RG.partition(geom.xyz, centres, np.asarray(weights, dtype=float),
+                               assign="nearest", w_min=self.w_min if w_min is None else w_min,
+                               r_cut=self.r_cut)
+        return kept
 
     # -- build ------------------------------------------------------------------
     def build(self, method: str = "liechtenstein") -> Device:
@@ -1549,23 +1831,38 @@ class DFTDevice:
                                original_atoms=orig),
                      nm_tol=self.nm_tol)
 
+        moment_report = None
         if H_sp is not None:            # FM vertices (liechtenstein; rkky_nm by default)
+            g_sp = H_sp.geometry
+            moments, src = RG.moments_or_none(self.file, na=H_full.na, column=self.mulliken_column,
+                                              required=self.weight == "mulliken")
+            m_dev = np.asarray(moments, dtype=float)[np.asarray(orig, dtype=int)]
+            if self.region == "disjoint":
+                w = RG.atom_delta_weights(H_sp) if self.weight == "delta" else np.abs(m_dev)
+                kept = self._nearest_regions(g_sp, anchors, w)
+                region_kw = [dict(region="atom_mask",
+                                  atom_mask=[int(orig[a]) for a in kept[k]]) for k in range(2)]
+            else:
+                region_kw = [dict(region=self.region, radius=self.radius,
+                                  atom_mask=self.atom_mask)] * 2
             Deltas, orbs = [], []
-            for spec, a in zip(self.specs, anchors):
+            for spec, a, kw in zip(self.specs, anchors, region_kw):
                 D, orb, _ = JD.extract_single_Delta(
                     H_host=H_sp, H_polarized_file=str(self.file), host_anchor=a,
-                    basis=self.basis, tol=self.tol, region=self.region,
-                    radius=self.radius, atom_mask=self.atom_mask,
+                    basis=self.basis, tol=self.tol, **kw,
                     **spec.delta_kwargs("liechtenstein", companions=self.specs))
                 Deltas.append(sparse.csr_matrix(D))
                 orbs.append(np.asarray(orb, dtype=int))
+            region_atoms = [np.unique(g_sp.o2a(o)) for o in orbs]
+            moment_report = RG.region_moment_report({f"FM device ({src})": m_dev}, region_atoms)
+            dev.info["region_moments_muB"] = moment_report
             overlap = np.intersect1d(orbs[0], orbs[1]).size
             message = (f"The FM vertex regions share {overlap} orbitals; both vertices come "
                        "from the same Hamiltonian, so they must be disjoint (region 'radius' "
                        f"below about {adist / 2:.2f} Ang, or 'atom_mask')")
             fm_needed = method == "liechtenstein" or (method == "rkky_nm"
                                                       and self.vertex_source == "fm")
-            if overlap and fm_needed:
+            if overlap:                  # never allowed (double counting)
                 raise ValueError(message)
             if overlap:
                 # FM vertices not needed for this build: the device does not offer them
@@ -1583,6 +1880,8 @@ class DFTDevice:
                 f"{i['label']}: {i['n_atoms']} atoms, captured {100 * i['captured_fraction']:.2f}%"
                 for i in infos)
         dev.info["vertex_source_rkky_nm"] = self.vertex_source
+        dev.info["built_method"] = method
+        dev.info["region_text"] = ("disjoint (nearest)" if self.region == "disjoint" else self.region)
         dev.Deltas, dev.orbs = dev.vertex_sets[method]
         electrode = {}
         if H_sp is not None:
@@ -1605,10 +1904,13 @@ class DFTDevice:
             elif "rkky_nm" in dev.vertex_sets:
                 region += "; rkky_nm uses the FM vertices"
             _report_vertices(region, dev.vertex_sets)
+            if moment_report is not None:
+                print("Mulliken moment per region:\n" + RG.format_moment_report(moment_report))
             if "liechtenstein_unavailable" in dev.info:
                 print("liechtenstein:      not offered (" + dev.info["liechtenstein_unavailable"][:60] + "...)")
             _close()
             print(dev.summary(), flush=True)
+        self.built = dev
         return dev
 
 

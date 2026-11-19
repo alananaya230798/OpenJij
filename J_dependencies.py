@@ -1,3 +1,4 @@
+import warnings
 import numpy as np
 import scipy as sp
 from scipy.sparse import eye
@@ -18,6 +19,36 @@ from dataclasses import dataclass
 from typing import Optional
 from scipy import sparse
 from scipy.sparse.linalg import splu
+
+# ---------------------------------------------------------------------------
+# Reading DFT Hamiltonians (one place, so every matrix gets the same sparsity)
+# ---------------------------------------------------------------------------
+SPARSITY_ATOL = 1e-6   # elements with |H_up|, |H_dn| (eV) and |S| all <= atol are removed
+
+
+def set_sparsity_atol(atol):
+    """Set the default tolerance of read_hamiltonian.
+    0 removes only exact zeros; None removes nothing."""
+    global SPARSITY_ATOL
+    SPARSITY_ATOL = None if atol is None else float(atol)
+    return SPARSITY_ATOL
+
+
+def read_hamiltonian(file, atol="default"):
+    """Read a SIESTA/TranSiesta Hamiltonian and drop negligible stored elements.
+
+    sisl's eliminate_zeros removes a stored (i, j) element only if ALL components
+    (every spin of H, in eV, and S) are <= atol. The same tolerance is used for every
+    file (pristine, single-defect and two-defect), so differences such as
+    V = H_def - H_0 contain no artificial entries larger than atol.
+    atol: 'default' -> SPARSITY_ATOL, None -> keep the file as read.
+    """
+    atol = SPARSITY_ATOL if atol == "default" else atol
+    H = sisl.get_sile(str(file)).read_hamiltonian()
+    if atol is not None:
+        H.eliminate_zeros(atol=float(atol))
+    return H
+
 
 def find_C_with_outofplane_H(struct, cutoff=1.2, z_thresh=0.3):
     """Find carbons bonded to H atoms that are displaced in z."""
@@ -87,7 +118,7 @@ def get_Delta_orbital_atoms(
         "dz2": {(2, 0)},
         "dxz": {(2, 1)},
         "dx2-y2": {(2, 2)},
-        "dz": {(2, -1),(2,0), (2, 1)}, # removed dz2 l=2 m=0
+        "dz": {(2, -1),(2,0), (2, 1)}, # dz2 important for adatoms
         "d": {(2, m) for m in range(-2, 3)},
     }
     diag = np.asarray(Delta.diagonal()).real
@@ -179,6 +210,21 @@ def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_b
 
     valid_extra = ("s", "p", "pz", "s+pz", "all")
     base_atoms = set(np.flatnonzero(np.isin(H.atoms.Z, (5, 6, 7, 8, 9))).tolist())
+    if basis == "full" and extra:
+        # 'full' keeps every atom and orbital, adatoms included: keep_orbitals only
+        # identifies atoms that are kept anyway. A partial label cannot be honoured.
+        for ia, label in extra.items():
+            if not 0 <= ia < H.na:
+                raise IndexError(f"Invalid atom index in keep_orbitals: {ia}")
+            if label not in valid_extra:
+                raise ValueError(f"Invalid orbital selection '{label}' for atom {ia}")
+            if ia in removed:
+                raise ValueError(f"Atom {ia} is in both remove_atoms and keep_orbitals")
+        partial = {ia: lab for ia, lab in extra.items() if lab != "all"}
+        if partial:
+            warnings.warn(f"basis='full' keeps all orbitals; keep_orbitals labels {partial} "
+                          "are ignored")
+        extra = {}
     for ia, label in extra.items():
         if not 0 <= ia < H.na:
             raise IndexError(f"Invalid atom index in keep_orbitals: {ia}")
@@ -210,7 +256,7 @@ def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_b
         original_ia = int(original_indices[ia])
         pz = [io for io, orb in enumerate(atom.orbitals)
               if orb.l == 1 and orb.m == 0]
-        dz = [io for io, orb in enumerate(atom.orbitals) # check remove the dz2 l=2 m=0
+        dz = [io for io, orb in enumerate(atom.orbitals) # dz2 important for adatoms
               if orb.l == 2 and orb.m in (-1,0, 1)]
 
         # NEW: select orbitals on explicitly retained adatoms by label.
@@ -374,7 +420,7 @@ def extract_single_Delta(
         raise ValueError("region must be 'all', 'radius', 'square', or 'atom_mask'")
 
     # 1. Read the spin-polarized Hamiltonian
-    H_sp = sisl.get_sile(H_polarized_file).read_hamiltonian()
+    H_sp = read_hamiltonian(H_polarized_file)
     if not H_sp.spin.is_polarized:
         raise ValueError("A collinear spin-polarized Hamiltonian is required")
 
@@ -621,7 +667,7 @@ def prune_ham(
     """
 
     # 1. Read Hamiltonian
-    H_0_DFT = sisl.get_sile(H_PRISTINE_FILE).read_hamiltonian()
+    H_0_DFT = read_hamiltonian(H_PRISTINE_FILE)
     basis = basis.lower().replace(" ", "")
     align = align.lower()
     valid_basis = ("pz1", "pz", "pz+dz", "full")
@@ -683,7 +729,7 @@ def prune_ham(
             pz_idx = [io for io, orb in enumerate(atom.orbitals)if orb.l == 1 and orb.m == 0]
             # dz : dxz, dyz, dz2
             # l=2, m=-1, 0, +1
-            dz_idx = [io for io, orb in enumerate(atom.orbitals)if orb.l == 2 and orb.m in (-1,0, 1)] # check remove dz2 l=2 m=0
+            dz_idx = [io for io, orb in enumerate(atom.orbitals)if orb.l == 2 and orb.m in (-1,0, 1)] # dz2 important for adatoms
             # Additional atoms use their own orbital selection
             if original_ia in extra_selection:
                 label = extra_selection[original_ia]
@@ -1201,7 +1247,7 @@ def calculate_exchange(
     left_orbs=None,
     right_orbs=None,
     lead_eta=1e-5,
-    prefactor = -1.0 / np.pi,
+    prefactor = -1.0 /(2*np.pi),
     self_energy_mode="compute",
     calculation_folder=None,
     write_results=False,
@@ -1245,7 +1291,7 @@ def calculate_exchange(
         note this is only safe when the device interface orbital ordering
         matches the electrode's surface orbital ordering exactly.
     prefactor : float or complex
-        User-defined multiplier of the contour-weighted kernel (default -1/pi).
+        User-defined multiplier of the contour-weighted kernel (default -1/2pi).
         Its sign and normalization depend on the Heisenberg convention,
         Delta=H_up-H_down and the contour weights; benchmark these factors.
     lead_eta : float
@@ -1682,7 +1728,7 @@ def select_retained_orbitals(H, H_idx, basis="pz"):
         for io, orb in zip(atom_orbs, atom.orbitals):
 
             pz = (orb.l == 1 and orb.m == 0)
-            dz = (orb.l == 2 and orb.m in (-1,0, 1)) # removed m=0 dz2
+            dz = (orb.l == 2 and orb.m in (-1,0, 1)) # dz2 important for adatoms
 
             if basis == "all":
                 keep = True
@@ -1987,8 +2033,10 @@ def align_defect_to_electrodes(
     polarized_ref = H_0.spin.is_polarized
     polarized = H_def.spin.is_polarized
 
-    H_ref_up = H_ref_local.Hk(spin=0, format="csr")
-    H_up = H_def_local.Hk(spin=0, format="csr")
+    # unpolarized matrices take no spin argument in recent sisl
+    H_ref_up = (H_ref_local.Hk(spin=0, format="csr") if polarized_ref
+                else H_ref_local.Hk(format="csr"))
+    H_up = H_def_local.Hk(spin=0, format="csr") if polarized else H_def_local.Hk(format="csr")
 
     if polarized_ref:
         H_ref_dn = H_ref_local.Hk(spin=1, format="csr")
@@ -2088,7 +2136,8 @@ def align_defect_to_electrodes(
     H_aligned = H_def.copy()
     H_aligned.shift(dev_eshift)
 
-    H0_up = H_0.Hk(k=[0, 0, 0], spin=0, format="csr")
+    H0_up = (H_0.Hk(k=[0, 0, 0], spin=0, format="csr") if polarized_ref
+             else H_0.Hk(k=[0, 0, 0], format="csr"))
 
     if polarized_ref:
         H0_dn = H_0.Hk(k=[0, 0, 0], spin=1, format="csr")

@@ -14,8 +14,12 @@ From a results folder (also results copied from the cluster):
     atomic_contributions_table(results_dir)   the same as a table
 
 From the ExchangeRun returned by run_exchange (they need the device or system):
-    plot_setup(run)       device, vertex regions, electrodes, adatoms, defect region
-    plot_vertices(run)    spin splitting of the two vertices per atom
+    plot_setup(run)       device, vertex regions (+ Mulliken moments), electrodes, anchors
+    plot_vertices(run)    spin splitting of the two vertices per atom, zoomed on the defects
+
+The geometry plots also take a built Device / DysonSystem, or are called from it:
+    dev = PristineTiled(...).build("rkky");  dev.plot_setup();  dev.plot_vertices()
+    builder.plot_setup()  /  builder.plot_vertices()      (last build of the builder)
     plot_dos(run)         DOS of the reference of the method, with a comparison
     plot_all(run)         everything above
 
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -36,224 +41,238 @@ import J_dependencies as JD
 from Device_Builder import compute_dos
 from Exchange_Workflow import ExchangeRun, load_results
 
-__all__ = ["plot_setup", "plot_vertices", "plot_orbital_contributions", "plot_exchange_kernel",
+__all__ = ["plot_setup", "plot_vertices", "plot_regions", "region_atoms", "draw_regions",
+           "draw_electrodes", "draw_anchors",
+           "plot_orbital_contributions", "plot_exchange_kernel",
            "plot_atomic_contributions", "atomic_contributions_table", "plot_dos", "plot_all",
            "optional_import"]
 
-
-def optional_import(module: str, purpose: str = "this plot"):
-    """Import an optional plotting library, with a clear message if it is missing."""
-    try:
-        return importlib.import_module(module)
-    except ImportError as err:
-        raise ImportError(f"{purpose} needs the optional package '{module}' "
-                          f"(pip install {module.split('.')[0]})") from err
+REGION_COLORS = ("red", "blue")       # vertex region of defect i / defect j
 
 
-def _dir(run_or_dir) -> Path:
-    return run_or_dir.results_dir if isinstance(run_or_dir, ExchangeRun) else Path(run_or_dir)
+def _view(src, method=None):
+    """Everything the geometry plots need, from an ExchangeRun, a Device or a DysonSystem.
+
+    method: for a Device / DysonSystem, the method whose vertices are shown (default:
+    the method it was built for; for a DysonSystem, 'liechtenstein_sup' vertices
+    follow info['vertices']).
+    """
+    from types import SimpleNamespace
+    from Device_Builder import canonical_method
+    if isinstance(src, ExchangeRun):
+        obj, cfg = src.obj, src.config
+        Ds, orbs = src.vertices()
+        meth, builder = src.method, cfg["builder"]
+        region = cfg.get("region", "")
+        if region == "disjoint":
+            region += " (" + (cfg.get("region_assign") or
+                              ("nearest" if builder == "DFTDevice" else "dominant")) + ")"
+    else:
+        obj = src
+        info = getattr(obj, "info", {})
+        if obj.__class__.__name__ == "DysonSystem":
+            meth = canonical_method(method) if method else "liechtenstein_sup"
+            total = meth == "liechtenstein_sup" and info.get("vertices", "own") == "region"
+            Ds = list(obj.vertex_total if total else obj.vertex_own)
+            orbs = list(obj.orbs)
+            builder = "SuperpositionDyson"
+        else:
+            meth = canonical_method(method) if method else info.get("built_method", obj.methods[0])
+            Ds, orbs = obj.vertices(meth) if method else (obj.Deltas, obj.orbs)
+            builder = obj.kind
+        region = info.get("region_text", "")
+    return SimpleNamespace(obj=obj, H=obj.H, g=obj.H.geometry, Ds=Ds, orbs=orbs, method=meth,
+                           builder=builder, region=region, anchors=list(obj.anchors),
+                           left=obj.left_orbs, right=obj.right_orbs,
+                           info=getattr(obj, "info", {}), distance=obj.anchor_distance)
 
 
-# ===========================================================================
-# Plots from the results folder (any method, also results from the cluster)
-# ===========================================================================
-def _orbital_classes(geo, side):
-    """Masks of the vertex orbitals: carbon pz, adatom H, d (only nonempty classes)."""
-    names = geo[f"orbital_names_{side}"]
-    Z = geo["Z"][geo[f"atoms_{side}"]]
-    h = Z == 1
-    classes = {"C-pz": np.array(["pz" in n for n in names]) & ~h,
-               "H": h,
-               "d": np.array(["d" in n for n in names]) & ~h}
-    return {k: v for k, v in classes.items() if v.any()}
+def region_atoms(src, method=None):
+    """Device atoms of the two vertex regions (static part + folded carbons)."""
+    v = src if hasattr(src, "Ds") else _view(src, method)
+    return [np.unique(v.g.o2a(np.asarray(o, dtype=int))) for o in v.orbs]
 
 
-def plot_orbital_contributions(run_or_dir, ax=None):
-    """Bar chart of J from pairs of orbital classes (rows i, columns j)."""
-    res, geo, cfg = load_results(_dir(run_or_dir))
-    J_orb = res["J_orb_meV"]
-    ci, cj = _orbital_classes(geo, "i"), _orbital_classes(geo, "j")
-    labels, values = [], []
-    for a, mi in ci.items():
-        for b, mj in cj.items():
-            labels.append(f"{a}-{b}")
-            values.append(J_orb[np.ix_(mi, mj)].sum())
-    J_total = float(res["J_meV"])
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 4))
-    ax.bar(labels, values)
-    ax.axhline(0, color="black", lw=0.8)
-    ax.axhline(J_total, color="red", ls="--", label=rf"Total $J$ = {J_total:.4f} meV")
-    ax.set_ylabel("Exchange contribution [meV]")
-    ax.set_title(f"{str(res['method'])}: orbital-class contributions")
-    ax.legend()
-    plt.setp(ax.get_xticklabels(), rotation=30)
-    plt.tight_layout()
-    return dict(zip(labels, values))
+# Marker areas of plot_atoms (points^2), so overlays have the same size as the atoms
+_ATOM_SIZE = {1: 10.0, 5: 70.0, 6: 50.0, 7: 70.0}
+ELECTRODE_COLOR = "tab:green"
 
 
-def plot_exchange_kernel(run_or_dir):
-    """Weighted kernel along the contour: total, orbital classes, and the contour."""
-    d = _dir(run_or_dir)
-    res, geo, cfg = load_results(d)
-    z = res["energies"]
-    K = res["weighted_kernel_kE"][0]
-    fig, ax = plt.subplots(3, 1, figsize=(6, 6), sharex=True)
-    ax[0].scatter(z.real, 1000 * K.imag, s=15, c=z.imag, label="Im(K)")
-    ax[0].scatter(z.real, 1000 * K.real, s=15, c=z.imag, marker="x", label="Re(K)")
-    ax[0].set_ylabel("Total weighted [meV]")
-    ax[0].legend()
-    korb = d / "weighted_orbital_kernel.npy"
-    if "weighted_class_kernel_kE" in res.files:          # per-energy kernel per class pair
-        Kc = res["weighted_class_kernel_kE"][0]
-        names_i, names_j = res["class_names_i"], res["class_names_j"]
-        for a, na in enumerate(names_i):
-            for b, nb in enumerate(names_j):
-                if np.abs(Kc[:, a, b]).max() > 0:
-                    ax[1].scatter(z.real, 1000 * Kc[:, a, b].imag, s=10, label=f"{na}-{nb}")
-        ax[1].legend(fontsize=7)
-    elif korb.is_file():                                 # full orbital kernel (large)
-        K_orb = np.load(korb, mmap_mode="r")[0]
-        ci, cj = _orbital_classes(geo, "i"), _orbital_classes(geo, "j")
-        for a, mi in ci.items():
-            for b, mj in cj.items():
-                Kab = np.asarray(K_orb[:, mi][:, :, mj]).sum(axis=(1, 2))
-                if np.abs(Kab).max() > 0:
-                    ax[1].scatter(z.real, 1000 * Kab.imag, s=10, label=f"{a}-{b}")
-        ax[1].legend(fontsize=7)
-    ax[1].set_ylabel("Orbital weighted K [meV]")
-    sc = ax[2].scatter(z.real, z.imag, c=z.imag, cmap="viridis", s=15)
-    ax[2].set_xlabel("Re(E) [eV]")
-    ax[2].set_ylabel("Im(E) [eV]")
-    for a in ax:
-        plt.colorbar(sc, ax=a, label="Im(E) [eV]")
-    plt.tight_layout()
-    return fig
+def _atom_sizes(geometry, atoms):
+    Z = np.asarray(geometry.atoms.Z)[np.asarray(atoms, dtype=int)]
+    return np.array([_ATOM_SIZE.get(int(z), 50.0) for z in Z])
 
 
-def _atomic(res, geo):
-    J_orb = res["J_orb_meV"]
-    xyz = geo["xyz"]
-    ai, aj = geo["atoms_i"].astype(int), geo["atoms_j"].astype(int)
-    Ji, Jj = np.zeros(len(xyz)), np.zeros(len(xyz))
-    np.add.at(Ji, ai, J_orb.sum(axis=1))
-    np.add.at(Jj, aj, J_orb.sum(axis=0))
-    selected = np.union1d(ai, aj)
-    return Ji, Jj, 0.5 * (Ji + Jj), selected
+def draw_regions(ax, geometry, regions, colors=REGION_COLORS, lw: float = 1.0,
+                 alpha: float = 1.0, bond: float = 1.77, labels=("region i", "region j"),
+                 style: str = "rings"):
+    """Mark each vertex region in red (i) / blue (j).
 
-
-def atomic_contributions_table(run_or_dir) -> None:
-    """Print the atom-resolved contributions J_i, J_j and their symmetric average."""
-    res, geo, cfg = load_results(_dir(run_or_dir))
-    Ji, Jj, Ja, selected = _atomic(res, geo)
-    xyz, Z = geo["xyz"], geo["Z"]
-    print(f"{'Atom':>6} {'Z':>4} {'x [Å]':>10} {'y [Å]':>10} {'J_i [meV]':>14} {'J_j [meV]':>14} {'J_a [meV]':>14}")
-    print("-" * 78)
-    for a in selected:
-        print(f"{a:6d} {Z[a]:4d} {xyz[a, 0]:10.3f} {xyz[a, 1]:10.3f} {Ji[a]:14.6f} {Jj[a]:14.6f} {Ja[a]:14.6f}")
-    print("-" * 78)
-    print(f"Total J = {float(res['J_meV']):.6f} meV")
-
-
-def plot_atomic_contributions(run_or_dir, label_top: int = 5, cmap: str = "coolwarm"):
-    """Map of the atom-resolved contributions (top view and side view)."""
+    style 'rings' (default): an open ring (facecolor none) on every atom of the region,
+          with the same size as the atom drawn by plot_atoms, so the atom colour
+          underneath (Delta, or the plain atom) stays visible.
+    style 'outline': thick lines along the perimeter of the region.
+    style 'bonds'  : every bond inside the region as a thick line.
+    Returns the legend handles.
+    """
     from scipy.spatial import cKDTree
-    from matplotlib.collections import LineCollection
-    res, geo, cfg = load_results(_dir(run_or_dir))
-    Ji, Jj, Ja, selected = _atomic(res, geo)
-    xyz = geo["xyz"]
-    vals = Ja[selected]
-    lim = np.max(np.abs(vals)) if np.any(vals) else 1.0
-    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(12, 5), sharex=True,
-                                  gridspec_kw=dict(height_ratios=(3, 1)))
-    pairs = np.array(list(cKDTree(xyz).query_pairs(r=1.78)), dtype=int).reshape(-1, 2)
-    if len(pairs):
-        ax.add_collection(LineCollection(xyz[pairs, :2], colors="0.78", linewidths=0.8, zorder=1))
-    ax.scatter(xyz[:, 0], xyz[:, 1], s=18, facecolor="0.82", edgecolor="0.6", linewidth=0.2, zorder=2)
-    sizes = 45 + 140 * (np.abs(vals) / lim) ** 0.6
-    sc = ax.scatter(xyz[selected, 0], xyz[selected, 1], c=vals, s=sizes, cmap=cmap,
-                    vmin=-lim, vmax=lim, edgecolors="black", linewidths=0.35, zorder=3)
-    defects = geo["defect_atoms"]
-    ax.scatter(xyz[defects, 0], xyz[defects, 1], s=80, c="red", marker="X",
-               edgecolors="black", linewidths=0.8, zorder=5, label="anchors")
-    adatoms = geo["adatom_atoms"] if "adatom_atoms" in geo.files else []
-    if len(adatoms):
-        ax.scatter(xyz[adatoms, 0], xyz[adatoms, 1], s=60, c="cyan", edgecolors="black",
-                   linewidths=0.8, zorder=6, label="adatoms")
-        ax2.scatter(xyz[adatoms, 0], xyz[adatoms, 2], s=60, c="cyan", edgecolors="black", zorder=6)
-    for a in selected[np.argsort(np.abs(vals))[::-1][:label_top]]:
-        ax.annotate(f"{Ja[a]:.3f}", xyz[a, :2], fontsize=7, xytext=(3, 3), textcoords="offset points")
-    plt.colorbar(sc, ax=ax, label=r"$J_a$ [meV]")
-    ax.set_aspect("equal")
-    ax.set_ylabel("y [Å]")
-    ax.set_title(f"{str(res['method'])}: atomic contributions, J = {float(res['J_meV']):.4f} meV")
-    ax.legend(fontsize=7, loc="upper right")
-    ax2.scatter(xyz[:, 0], xyz[:, 2], s=10, c="0.7")
-    ax2.scatter(xyz[selected, 0], xyz[selected, 2], c=vals, s=sizes / 3, cmap=cmap, vmin=-lim, vmax=lim)
-    ax2.set_xlabel("x [Å]")
-    ax2.set_ylabel("z [Å]")
-    plt.tight_layout()
-    return fig
+    from matplotlib.lines import Line2D
+    if style not in ("rings", "outline", "bonds"):
+        raise ValueError("style must be 'rings', 'outline' or 'bonds'")
+    xyz = np.asarray(geometry.xyz)
+    heavy = geometry.atoms.Z > 1
+    handles = []
+    if style != "rings":
+        pairs = np.array(sorted(cKDTree(xyz).query_pairs(bond)), dtype=int).reshape(-1, 2)
+        if len(pairs):
+            pairs = pairs[heavy[pairs[:, 0]] & heavy[pairs[:, 1]]]
+    for k, (atoms, col) in enumerate(zip(regions, colors)):
+        atoms = np.asarray(atoms, dtype=int)
+        if style == "rings":
+            ax.scatter(xyz[atoms, 0], xyz[atoms, 1], s=_atom_sizes(geometry, atoms),
+                       facecolors="none", edgecolors=col, linewidths=lw, alpha=alpha, zorder=6)
+            handles.append(Line2D([0], [0], marker="o", ls="none", markerfacecolor="none",
+                                  markeredgecolor=col, markeredgewidth=lw, markersize=7,
+                                  label=f"{labels[k]} ({len(atoms)} atoms)"))
+            continue
+        inside = np.zeros(len(xyz), dtype=bool)
+        inside[atoms] = True
+        sel = pairs[inside[pairs[:, 0]] & inside[pairs[:, 1]]] if len(pairs) else pairs
+        n_in = np.bincount(sel.ravel(), minlength=len(xyz)) if len(sel) else np.zeros(len(xyz), int)
+        draw = sel
+        if style == "outline":
+            border = inside & (n_in < 3)
+            draw = sel[border[sel[:, 0]] & border[sel[:, 1]]] if len(sel) else sel
+        for p, q in draw:
+            ax.plot(xyz[[p, q], 0], xyz[[p, q], 1], color=col, lw=2 * lw, alpha=alpha,
+                    solid_capstyle="round", zorder=6)
+        lone = np.flatnonzero(inside & heavy & (n_in == 0))
+        if lone.size:
+            ax.scatter(xyz[lone, 0], xyz[lone, 1], s=_atom_sizes(geometry, lone),
+                       facecolors="none", edgecolors=col, linewidths=lw, zorder=6)
+        handles.append(Line2D([0], [0], color=col, lw=2 * lw, alpha=alpha,
+                              label=f"{labels[k]} ({int(inside.sum())} atoms)"))
+    return handles
 
 
-# ===========================================================================
-# Plots that need the run (device, vertices, DOS)
-# ===========================================================================
-def plot_setup(run: ExchangeRun, ylim=None):
-    """Device geometry: anchors, vertex regions, electrodes, adatoms (and region R)."""
-    H = run.H
-    g = H.geometry
-    fig, ax = plot_atoms(g, annotate=False, size=12)
-    _, orbs = run.vertices()
-    colors = ("red", "blue")
+def draw_electrodes(ax, src, color: str = ELECTRODE_COLOR, lw: float = 1.0):
+    """Open rings (atom size) on the left and right electrode cells of the device."""
+    from matplotlib.lines import Line2D
+    v = src if hasattr(src, "Ds") else _view(src)
+    g = v.g
+    at = np.unique(np.concatenate([g.o2a(np.asarray(o, dtype=int)) for o in (v.left, v.right)]))
+    ax.scatter(g.xyz[at, 0], g.xyz[at, 1], s=_atom_sizes(g, at), facecolors="none",
+               edgecolors=color, linewidths=lw, zorder=6)
+    return [Line2D([0], [0], marker="o", ls="none", markerfacecolor="none", markeredgecolor=color,
+                   markeredgewidth=lw, markersize=7, label="electrodes")]
 
-    for i, color in enumerate(colors):
-        anchor = int(run.obj.anchors[i])    
-        ax.scatter(
-            [g.xyz[anchor, 0]],
-            [g.xyz[anchor, 1]],
-            s=150,
-            marker="o",
-            edgecolors=color,facecolors="none",
-            zorder=10,label=fr"Defect {i}")
-    if run.config["builder"] == "SuperpositionDyson":
-        R_at = g.o2a(run.obj.R, unique=True)
-        ax.scatter(g.xyz[R_at, 0], g.xyz[R_at, 1], s=70, facecolors="none",edgecolors="k", label="region R")
-    for orbs_e, col in ((run.obj.left_orbs, "tab:green"), (run.obj.right_orbs, "tab:green")):
-        at = g.o2a(np.asarray(orbs_e), unique=True)
-        ax.scatter(g.xyz[at, 0], g.xyz[at, 1], s=70, c=col,edgecolors='k',linewidths=0.1)
-    h = np.flatnonzero(g.atoms.Z == 1)
-    h = [a for a in h if min(np.linalg.norm(g.xyz[a] - g.xyz[list(run.obj.anchors)], axis=1)) < 1.6]
-    #if h:
-    #    ax.scatter(g.xyz[h, 0], g.xyz[h, 1], s=60, c="cyan", edgecolors="black", label="adatoms")
+
+def draw_anchors(ax, src, colors=REGION_COLORS, s: float = 220.0, lw: float = 1.8):
+    """Dashed circles on the two defect anchors."""
+    from matplotlib.lines import Line2D
+    v = src if hasattr(src, "Ds") else _view(src)
+    g = v.g
+    handles = []
+    for i, col in enumerate(colors):
+        a = int(v.anchors[i])
+        ax.scatter([g.xyz[a, 0]], [g.xyz[a, 1]], s=s, facecolors="none", edgecolors=col,
+                   linewidths=lw, linestyles="--", zorder=7)
+        handles.append(Line2D([0], [0], marker="o", ls="none", markerfacecolor="none",
+                              markeredgecolor=col, markersize=10, markeredgewidth=lw,
+                              label=f"defect {'ij'[i]} anchor"))
+    return handles
+
+
+def _legend_below(ax, handles):
+    # below the x label, at a fixed distance in font units (independent of the aspect)
+    ax.legend(handles=handles, fontsize=7, loc="upper center", bbox_to_anchor=(0.5, 0.0),
+              borderaxespad=5.5, ncol=min(len(handles), 5), frameon=False)
+
+
+def _zoom(ax, v, window, ylim=None):
+    """Axis limits: anchors +/- window (Ang) in x and y; window None = whole device
+    (y fitted to the atoms +/- 3 Ang instead of the vacuum of the cell)."""
+    if window is not None:
+        xy = v.g.xyz[v.anchors, :2]
+        ax.set_xlim(xy[:, 0].min() - window, xy[:, 0].max() + window)
+        ax.set_ylim(xy[:, 1].min() - window, xy[:, 1].max() + window)
+    else:
+        y = v.g.xyz[:, 1]
+        ax.set_ylim(y.min() - 3.0, y.max() + 3.0)
     if ylim is not None:
         ax.set_ylim(*ylim)
-    ax.legend(fontsize=7)
-    ax.set_title(f"{run.method}: device ({run.config['builder']}), "
-                 f"d = {run.obj.anchor_distance:.2f} Å")
+
+
+def plot_setup(src, method: Optional[str] = None, ylim=None, show_regions: bool = True,
+               region_lw: float = 0.25, region_style: str = "rings", window=None):
+    """Device geometry with the vertex regions (red / blue rings, Mulliken moment of every
+    defect cloud inside each region in the legend when available), the electrodes
+    (green rings) and the anchors (dashed circles).
+
+    src    : ExchangeRun, Device or DysonSystem (also device.plot_setup()).
+    window : None (whole device, default) or half-width (Ang) around the anchors.
+    """
+    v = _view(src, method)
+    g = v.g
+    fig, ax = plot_atoms(g, annotate=False, size=12)
+    handles=[]
+    if show_regions:
+        labels = ["region i", "region j"]
+        rep = v.info.get("region_moments_muB")
+        if rep:
+            for k in range(2):
+                vals = [r["regions"][k] for r in rep.values()]
+                labels[k] += ", m = " + " / ".join(f"{x:+.3f}" for x in vals) + " muB"
+        handles += draw_regions(ax, g, region_atoms(v), lw=region_lw, labels=labels,
+                                style=region_style)
+    handles += draw_electrodes(ax, v)
+    handles += draw_anchors(ax, v)
+    _zoom(ax, v, window, ylim)
+    _legend_below(ax, handles)
+    ax.set_title(f"{v.method}: device ({v.builder}), region {v.region}, "
+                 f"d = {v.distance:.2f} Å", fontsize=9)
     return fig
 
 
-def plot_vertices(run: ExchangeRun, ylim=None, vabs: float = 0.5):
-    """Diagonal spin splitting of the two vertices per atom (pz and s orbitals).
+plot_regions = plot_setup        # merged into plot_setup (kept as an alias)
 
+
+def plot_vertices(src, method: Optional[str] = None, ylim=None, vabs: float = 0.25,
+                  show_regions: bool = True, region_lw: float = 0.25, both_regions: bool = True,
+                  region_style: str = "rings", window: Optional[float] = 25.0):
+    """Diagonal spin splitting of the two vertices per atom (pz, s and dz orbitals).
+
+    src          : ExchangeRun, Device or DysonSystem (also device.plot_vertices()).
+    window       : zoom, anchors +/- window Ang in x and y (default 10); None = whole device.
+    show_regions : regions as open rings of the atom size, red = region of defect i,
+                   blue = region of defect j, so the Delta colours stay visible
+                   (region_style 'rings'; or 'outline' / 'bonds').
+    both_regions : both regions on each figure (default) or only the one of the vertex.
+    The electrodes (green rings) and the anchors (dashed circles) are always shown.
     For the Dyson methods the static part is shown; folded adatoms add an
     energy-dependent correction inside the exchange calculation.
     """
-    H = run.H
-    g = H.geometry
-    Ds, orbs = run.vertices()
+    v = _view(src, method)
+    H, g = v.H, v.g
+    regions = region_atoms(v) if show_regions else None
     figs = []
-    colors = ("red", "blue")
-    for k, (D, o) in enumerate(zip(Ds, orbs)):
+    for k, (D, o) in enumerate(zip(v.Ds, v.orbs)):
         color = (JD.get_Delta_orbital_atoms(H, D, "pz", orb_host=np.asarray(o))
-                 + JD.get_Delta_orbital_atoms(H, D, "s", orb_host=np.asarray(o))+ JD.get_Delta_orbital_atoms(H, D, "dz", orb_host=np.asarray(o)))
+                 + JD.get_Delta_orbital_atoms(H, D, "s", orb_host=np.asarray(o))
+                 + JD.get_Delta_orbital_atoms(H, D, "dz", orb_host=np.asarray(o)))
         fig, ax = plot_atoms(g, color=color, size=8, vabs=vabs,
-                                label=rf"$\Delta_{'ij'[k]}$ (eV)")
-        for i, color in enumerate(colors):
-          ax.scatter(g.xyz[run.obj.anchors[i], 0],g.xyz[run.obj.anchors[i], 1], s=150, facecolors="none",edgecolors=color)
-        if ylim is not None:
-            ax.set_ylim(*ylim)
+                             label=rf"$\Delta_{'ij'[k]}$ (eV)")
+        handles = draw_electrodes(ax, v)
+        if show_regions:
+            show = [0, 1] if both_regions else [k]
+            handles += draw_regions(ax, g, [regions[i] for i in show],
+                                    colors=[REGION_COLORS[i] for i in show], lw=region_lw,
+                                    labels=[("region i", "region j")[i] for i in show],
+                                    style=region_style)
+        handles += draw_anchors(ax, v)
+        _zoom(ax, v, window, ylim)
+        _legend_below(ax, handles)
+        ax.set_title(rf"$\Delta_{'ij'[k]}$, {v.method}, region {v.region}", fontsize=9)
         figs.append(fig)
     return figs
 
@@ -307,7 +326,7 @@ def plot_all(run: ExchangeRun, dos: bool = True, ylim=None):
     """Every visualization of the tutorials for this run."""
     print(run.summary())
     plot_setup(run, ylim=ylim)
-    plot_vertices(run, ylim=ylim)
+    plot_vertices(run)
     plot_orbital_contributions(run)
     plot_exchange_kernel(run)
     plot_atomic_contributions(run)
@@ -375,7 +394,7 @@ def plot_pz_bands(H_0,H_0_DFT,path,sym_names,main_folder_local=None):
     return fig
 
 
-def plot_atoms(device,color=[],label=None,annotate=None,size=8,vabs=0.1):
+def plot_atoms(device,color=[],label=None,annotate=None,size=8,vabs=0.25):
     fig = plt.figure(figsize=(size, size))
     ax = plt.gca()
     ax.set_aspect('equal')# Plot bonds
