@@ -1,0 +1,48 @@
+{
+  "files": [
+    {
+      "mtime_ns": 1794392004000000000,
+      "path": "/home/cluster_mount/J_GNRs/Elec/siesta/siesta.fdf",
+      "size": 1864
+    },
+    {
+      "mtime_ns": 1794784895000000000,
+      "path": "/home/cluster_mount/J_GNRs/J_H0/n5/H0/FM/siesta_FM.fdf",
+      "size": 2082
+    }
+  ],
+  "schema": 4,
+  "settings": {
+    "N_buffer": 1,
+    "N_imp": 5,
+    "Z": 5,
+    "adatom_species": "H",
+    "align": "vb",
+    "basis": "pz+dz",
+    "builder": "DFTDevice",
+    "builder_kwargs": [
+      [
+        "axis",
+        "0"
+      ]
+    ],
+    "defect_entries": [],
+    "defect_i": "H0",
+    "defect_j": "H0",
+    "defect_type": "adatom",
+    "downfold": false,
+    "method": "liechtenstein",
+    "mulliken_column": 2,
+    "n_dist": 5,
+    "radius": 8.0,
+    "region": "disjoint",
+    "region_assign": null,
+    "region_rcut": null,
+    "region_weight": "delta",
+    "region_wmin": 0.0001,
+    "sparsity_atol": 1e-06,
+    "vertex_source": null,
+    "vertices": "own"
+  },
+  "sources": "f8feb48fc29e680023a12992a0648d32daf6b6652c5b4993886605be01fed59f"
+}

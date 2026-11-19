@@ -1,0 +1,4 @@
+method liechtenstein (DFTDevice): J = 13.088434 meV
+  defects H0 - H1, n_dist 2, distance 19.862 Ang (anchors)
+  basis pz+dz, region disjoint, downfold False, prefactor -0.159155
+  results: Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_disjoint

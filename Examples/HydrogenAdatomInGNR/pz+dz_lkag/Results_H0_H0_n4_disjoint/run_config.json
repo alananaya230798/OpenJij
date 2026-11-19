@@ -1,0 +1,53 @@
+{
+  "method": "liechtenstein",
+  "builder": "DFTDevice",
+  "basis": "pz+dz",
+  "n_dist": 4,
+  "defect_i": "H0",
+  "defect_j": "H0",
+  "defect_type": "adatom",
+  "adatom_species": "H",
+  "Z": 5,
+  "downfold": false,
+  "region": "disjoint",
+  "radius": 8.0,
+  "vertices": "own",
+  "vertex_source": null,
+  "vertex_downfold": "linear",
+  "prefactor": -0.15915494309189535,
+  "align": "vb",
+  "N_imp": 5,
+  "N_buffer": 1,
+  "nk": [
+    1,
+    0,
+    0
+  ],
+  "lead_eta": 1e-05,
+  "self_energy_mode": "compute+write",
+  "cache_static": true,
+  "build_from_cache": false,
+  "solver": "sparse",
+  "orbital_kernel": "classes",
+  "contour": "/home/Magnetic_Interactions/OpenJij/CC_40eV.TSCCEQ-Elec",
+  "sparsity_atol": 1e-06,
+  "region_assign": null,
+  "region_weight": "delta",
+  "region_wmin": 0.0001,
+  "region_rcut": null,
+  "mpi_ranks": 4,
+  "pristine_file": "/home/cluster_mount/J_GNRs/Elec/siesta/siesta.fdf",
+  "defect_files": {
+    "H0": "/home/cluster_mount/J_GNRs/GNR_H0/siesta/siesta.fdf"
+  },
+  "device_files": {
+    "FM": "/home/cluster_mount/J_GNRs/J_H0/n4/H0/FM/siesta_FM.fdf"
+  },
+  "J_meV": -0.3213838411962553,
+  "anchor_distance": 34.080025040114144,
+  "distance": 34.080025040114144,
+  "date": "2026-11-19T13:04:32",
+  "dos_eta": 0.01,
+  "dos_orbitals": "region",
+  "dos_n_energies": 51
+}

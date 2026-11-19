@@ -18,9 +18,6 @@ from Exchange_Workflow import run_exchange
 from plot_dependencies import (
     plot_setup,
     plot_vertices,
-    plot_orbital_contributions,
-    plot_exchange_kernel,
-    plot_atomic_contributions,
     plot_dos,
 )
 import sys
@@ -116,8 +113,8 @@ if IS_DFT_DEVICE:
 if EFFECTIVE_DOWNFOLD:
     results_name += "_downfold"
 
-SAVE_DOS = True                      # DOS computed with all MPI ranks inside run_exchange
-DOS_ENERGIES = np.linspace(-0.25,25,50)
+SAVE_DOS = False                      # DOS computed with all MPI ranks inside run_exchange
+DOS_ENERGIES = np.linspace(-0.25, 0.25, 51)   # eV around E_F (was -0.25..25 eV)
 SAVE_PDF = False
 PLOT_DPI = 200
 
@@ -220,11 +217,12 @@ def main():
 
     # This function returns a data dict but creates a Matplotlib figure.
     #plot_orbital_contributions(run.results_dir)
-    save_fig(plt.gcf(), "03_orbital_contributions", plot_dir)
-    save_fig(plot_exchange_kernel(run.results_dir), "04_exchange_kernel", plot_dir)
-    save_fig(plot_atomic_contributions(run.results_dir), "05_atomic_contributions", plot_dir)
+    #save_fig(plt.gcf(), "03_orbital_contributions", plot_dir)
+    #save_fig(plot_exchange_kernel(run.results_dir), "04_exchange_kernel", plot_dir)
+    #save_fig(plot_atomic_contributions(run.results_dir), "05_atomic_contributions", plot_dir)
+    
     if SAVE_DOS:
-        fig, _curves = plot_dos(run)          # plots the curves computed in parallel
+        fig, _curves = plot_dos(run,energies=DOS_ENERGIES )          # plots the curves computed in parallel
         save_fig(fig, "06_reference_DOS", plot_dir)
 
     (plot_dir / "summary.txt").write_text(run.summary() + "\n")

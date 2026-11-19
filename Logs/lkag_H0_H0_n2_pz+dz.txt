@@ -1,109 +1,6 @@
 Method: lkag; defects: H0/H0; separation: 2; basis: pz+dz; downfold: False
 Contour: 96 energies, mu = 0.0 eV, T = 50.0 K
-[build cache] nothing cached in Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H0_n2_R8.00/Static; building
-
-Basis selection: pz+dz
-Alignment: vb
-Energy shift: -0.010697 eV
-
-C: 44 atoms
-Orbitals on representative atom:
-  0: 2pzZ1
-  1: 3dyzZ1P
-  2: 3dz2Z1P
-  3: 3dxzZ1P
-
-Final Hamiltonian
-Atoms: 44
-Orbitals: 176
-Pristine cell: 44 atoms, 176 orbitals (basis pz+dz, align vb)
-
-========== Electrode alignment ==========
-Left offset:       +0.086575 eV
-Right offset:      +0.086456 eV
-Common shift:      +0.086515 eV
-Left-right diff:   0.119 meV
-
-========== Spin polarization ==========
-Electrode max |Hup-Hdn|:  0.000 meV
-Device left max splitting:  8.986 meV
-Device right max splitting: 9.233 meV
-
-========== Terminal onsite diagnostics ==========
-Left RMS residual:  0.445 meV
-Right RMS residual: 0.459 meV
-Left max splitting: 8.986 meV
-Right max splitting:9.233 meV
-
-========== Spin polarization matching ==========
-Electrode spin polarized: True
-Device spin polarized:    True
-Left spin mismatch:  8.986 meV
-Right spin mismatch: 9.233 meV
-
-========== Intra-cell matrix comparison after alignment==========
-Left max |dH|:      2.195 meV
-Right max |dH|:     2.250 meV
-Left max |dS|:      1.915e-04
-Right max |dS|:     1.915e-04
-
-========== Geometry mismatch ==========
-Left:  0.0013 Ang
-Right: 0.0013 Ang
-Interface orbitals: L=176, R=176
-========================================
-
-
-Basis: pz+dz
-Region: square
-Square half-side: 8.000 Angstrom
-Total defect atoms: 574
-Selected magnetic atoms: 84
-Selected orbitals: 336
-Delta shape: (336, 336)
-Max |Delta|: 0.501357 eV
-
-Basis: pz+dz
-Region: square
-Square half-side: 8.000 Angstrom
-Total defect atoms: 574
-Selected magnetic atoms: 84
-Selected orbitals: 336
-Delta shape: (336, 336)
-Max |Delta|: 0.500707 eV
-
-========== Electrode regions ==========
-(device cells coupled to the electrodes, after the energy alignment;
- compared with the central cell of the electrode)
-FM device (interface orbitals: L=176, R=176)
-  left:                   max |Hup-Hdn| 8.986 meV, max |dH| 2.195 meV, max |dS| 1.915e-04
-  right:                  max |Hup-Hdn| 9.233 meV, max |dH| 2.250 meV, max |dS| 1.915e-04
-Vertex splitting on electrode orbitals
-  liechtenstein:          i 0.000 meV, j 0.000 meV
-WARNING: FM device, left electrode region: spin splitting 8.986 meV (> 1.0 meV); the spin cloud has not decayed there
-WARNING: FM device, left electrode region: |dH| 2.195 meV after the energy alignment (> 1.0 meV)
-WARNING: FM device, left electrode region: |dS| 1.915e-04 (> 1.0e-04)
-WARNING: FM device, right electrode region: spin splitting 9.233 meV (> 1.0 meV); the spin cloud has not decayed there
-WARNING: FM device, right electrode region: |dH| 2.250 meV after the energy alignment (> 1.0 meV)
-WARNING: FM device, right electrode region: |dS| 1.915e-04 (> 1.0e-04)
-
-========== Vertices ==========
-Region:                   square (half-side = 8.00 Ang)
-liechtenstein i:            336 orbitals, max |Delta| 0.5014 eV
-liechtenstein j:            336 orbitals, max |Delta| 0.5007 eV
-liechtenstein overlap:        0 orbitals
-========================================
-
-dft device: 574 atoms, 2296 orbitals, spin polarized
-  methods: liechtenstein
-  electrodes: 176 + 176 orbitals (-A/+A)
-  vertices for liechtenstein:
-    H0: anchor atom 222, 336 vertex orbitals, max|Delta| = 0.5014 eV
-    H1: anchor atom 311, 336 vertex orbitals, max|Delta| = 0.5007 eV
-  distance: 17.040 Ang (anchors), 17.040 Ang (centers)
-  energy_shift_eV: 0.086515
-  vertex_source_rkky_nm: fm
-[build cache] built device saved to Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H0_n2_R8.00/Static
+[build cache] loaded the built device from Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H0_n2_disjoint/Static (no DFT file read)
 BLAS threads per rank: 2
 Computing liechtenstein with DFTDevice on 4 rank(s) ...
 Transport axis: 0
@@ -146,10 +43,11 @@ Looping over kpts
 Method: liechtenstein
 Looping over kpts
 Method: liechtenstein
-J = -5.783028 meV
-Results written to Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H0_n2_R8.00
-method liechtenstein (DFTDevice): J = -5.783028 meV
+DOS: 51 energies on 4 rank(s) ...
+J = -3.258817 meV
+Results written to Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H0_n2_disjoint
+method liechtenstein (DFTDevice): J = -3.258817 meV
   defects H0 - H0, n_dist 2, distance 17.040 Ang (anchors)
-  basis pz+dz, region square, downfold False, prefactor -0.318310
-  results: Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H0_n2_R8.00
-Figures saved in Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H0_n2_R8.00/Plots
+  basis pz+dz, region disjoint, downfold False, prefactor -0.159155
+  results: Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H0_n2_disjoint
+Figures saved in Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H0_n2_disjoint/Plots

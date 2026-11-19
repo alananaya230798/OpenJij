@@ -206,7 +206,7 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                  blas_threads="auto", dos_energies=None, dos_eta: float = 0.01,
                  dos_orbitals="region", sparsity_atol: Optional[float] = 1e-6,
                  region_assign: Optional[str] = None, region_weight: str = "delta",
-                 region_wmin: float = 1e-4, region_rcut: Optional[float] = None,
+                 region_wmin: float = 1e-3, region_rcut: Optional[float] = None,
                  mulliken_column: int = 2) -> Optional[ExchangeRun]:
     """Compute J for one defect pair with any implemented method.
 
@@ -234,7 +234,7 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                       rkky_sup, liechtenstein_sup) or 'nearest' (closest centre,
                       Voronoi; the only rule of rkky_nm / liechtenstein).
     region_weight   : 'delta' (||H_up - H_dn|| per atom, eV) or 'mulliken' (|m_a|, muB).
-    region_wmin, region_rcut : weight threshold and distance cutoff (Ang, None = none).
+    region_wmin, region_rcut : weight threshold (meV or muB) and distance cutoff (Ang, None = none).
     mulliken_column : spin column of read_charge('mulliken') in siesta.out; without an
                       output file the moments come from the density matrix.
     vertices        : liechtenstein_sup: 'own' (default) or 'region'

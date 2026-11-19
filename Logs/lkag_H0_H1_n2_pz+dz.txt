@@ -1,6 +1,6 @@
 Method: lkag; defects: H0/H1; separation: 2; basis: pz+dz; downfold: False
 Contour: 96 energies, mu = 0.0 eV, T = 50.0 K
-[build cache] nothing cached in Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_R8.00/Static; building
+[build cache] nothing cached in Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_disjoint/Static; building
 
 Basis selection: pz+dz
 Alignment: vb
@@ -53,23 +53,23 @@ Right: 0.0013 Ang
 Interface orbitals: L=176, R=176
 ========================================
 
+/home/Magnetic_Interactions/OpenJij/Device_Builder.py:1790: UserWarning: ||Delta|| up to 63.10 meV on the electrode interfaces is left out of the vertices; the device is too short for this spin cloud
+  warnings.warn(f"||Delta|| up to {1000 * dropped:.2f} meV on the electrode "
 
 Basis: pz+dz
-Region: square
-Square half-side: 8.000 Angstrom
+Region: atom_mask
 Total defect atoms: 574
-Selected magnetic atoms: 84
-Selected orbitals: 336
-Delta shape: (336, 336)
+Selected magnetic atoms: 232
+Selected orbitals: 928
+Delta shape: (928, 928)
 Max |Delta|: 0.535678 eV
 
 Basis: pz+dz
-Region: square
-Square half-side: 8.000 Angstrom
+Region: atom_mask
 Total defect atoms: 574
-Selected magnetic atoms: 84
-Selected orbitals: 336
-Delta shape: (336, 336)
+Selected magnetic atoms: 254
+Selected orbitals: 1016
+Delta shape: (1016, 1016)
 Max |Delta|: 0.535709 eV
 
 ========== Electrode regions ==========
@@ -88,32 +88,36 @@ WARNING: FM device, right electrode region: |dH| 2.242 meV after the energy alig
 WARNING: FM device, right electrode region: |dS| 1.915e-04 (> 1.0e-04)
 
 ========== Vertices ==========
-Region:                   square (half-side = 8.00 Ang)
-liechtenstein i:            336 orbitals, max |Delta| 0.5357 eV
-liechtenstein j:            336 orbitals, max |Delta| 0.5357 eV
+Region:                   disjoint
+liechtenstein i:            928 orbitals, max |Delta| 0.5357 eV
+liechtenstein j:           1016 orbitals, max |Delta| 0.5357 eV
 liechtenstein overlap:        0 orbitals
+Mulliken moment per region:
+  FM device (/home/cluster_mount/J_GNRs/J_H0/n2/H1/FM/siesta.out): total +1.990 muB; region i +0.996, region j +0.995 muB
 ========================================
 
 dft device: 574 atoms, 2296 orbitals, spin polarized
   methods: liechtenstein
   electrodes: 176 + 176 orbitals (-A/+A)
   vertices for liechtenstein:
-    H0: anchor atom 222, 336 vertex orbitals, max|Delta| = 0.5357 eV
-    H1: anchor atom 328, 336 vertex orbitals, max|Delta| = 0.5357 eV
+    H0: anchor atom 222, 928 vertex orbitals, max|Delta| = 0.5357 eV
+    H1: anchor atom 328, 1016 vertex orbitals, max|Delta| = 0.5357 eV
   distance: 19.862 Ang (anchors), 19.862 Ang (centers)
   energy_shift_eV: 0.066328
   vertex_source_rkky_nm: fm
-[build cache] built device saved to Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_R8.00/Static
-Transport axis: 0
-Reading Perturbations
-Transport axis: 0
-Reading Perturbations
+  built_method: liechtenstein
+  region_text: disjoint (nearest)
+[build cache] built device saved to Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_disjoint/Static
 Transport axis: 0
 Reading Perturbations
 BLAS threads per rank: 2
 Computing liechtenstein with DFTDevice on 4 rank(s) ...
 Transport axis: 0
 Reading Perturbations
+Transport axis: 0
+Reading Perturbations
+Transport axis: 0
+Reading Perturbations
 Reading CC
 Reading kpts
 Reading CC
@@ -123,33 +127,33 @@ Reading kpts
 Reading CC
 Reading kpts
 Processing self energy:
-writting self energy
 Processing self energy:
 writting self energy
 Processing self energy:
 writting self energy
 Processing self energy:
 writting self energy
+writting self energy
 Reading Self energy
 Reading Self energy
 Reading Self energy
 Reading Self energy
 Generating kernel
-Looping over kpts
-Method: liechtenstein
+Generating kernel
+Generating kernel
 Generating kernel
 Looping over kpts
 Method: liechtenstein
-Generating kernel
 Looping over kpts
 Method: liechtenstein
-Generating kernel
 Looping over kpts
 Method: liechtenstein
-J = 25.110893 meV
-Results written to Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_R8.00
-method liechtenstein (DFTDevice): J = 25.110893 meV
+Looping over kpts
+Method: liechtenstein
+J = 13.088434 meV
+Results written to Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_disjoint
+method liechtenstein (DFTDevice): J = 13.088434 meV
   defects H0 - H1, n_dist 2, distance 19.862 Ang (anchors)
-  basis pz+dz, region square, downfold False, prefactor -0.318310
-  results: Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_R8.00
-Figures saved in Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_R8.00/Plots
+  basis pz+dz, region disjoint, downfold False, prefactor -0.159155
+  results: Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_disjoint
+Figures saved in Examples/HydrogenAdatomInGNR/pz+dz_lkag/Results_H0_H1_n2_disjoint/Plots

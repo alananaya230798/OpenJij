@@ -1758,7 +1758,8 @@ class DFTDevice(_BuilderPlotMixin):
         regions_dev = [None, None]
         if RG.check_region(region) == "disjoint":
             g = device.H_nm.geometry
-            regions_dev = self._nearest_regions(g, device.anchors, np.ones(g.na), w_min=0.0)
+            regions_dev = self._nearest_regions(g, device.anchors, np.ones(g.na), w_min=0.0,
+                                                exclude_orbs=interfaces)
         Deltas, orbs, infos = [], [], []
         for k, one in enumerate(self.single_defects):
             D, o, inf = map_single_defect_vertex(
@@ -1770,13 +1771,31 @@ class DFTDevice(_BuilderPlotMixin):
         RG.check_disjoint(orbs[0], orbs[1], "rkky_nm single-defect vertex")
         return Deltas, orbs, infos
 
-    def _nearest_regions(self, geom, anchors, weights, w_min=None):
-        """Voronoi (nearest centre) regions on the device atoms, with w_min and r_cut."""
+    def _nearest_regions(self, geom, anchors, weights, w_min=None, exclude_orbs=(),
+                         delta_weights=None):
+        """Voronoi (nearest centre) regions on the device atoms, with w_min and r_cut.
+
+        Atoms of the electrode interfaces (exclude_orbs) never belong to a vertex: the
+        lead self-energies sit there. The largest ||Delta|| dropped there is reported
+        and a warning is given above ends_tol (the device is then too short).
+        """
         centres = np.array([np.asarray(geom.xyz[a]) + r.center_offset
                             for a, r in zip(anchors, (s.resolve() for s in self.specs))])
-        _, kept = RG.partition(geom.xyz, centres, np.asarray(weights, dtype=float),
+        w = np.array(weights, dtype=float)
+        excl = np.unique(geom.o2a(np.asarray(exclude_orbs, dtype=int))) if len(exclude_orbs) else []
+        if len(excl):
+            if delta_weights is not None:
+                dropped = float(np.max(np.asarray(delta_weights)[excl]))
+                if dropped > self.ends_tol:
+                    warnings.warn(f"||Delta|| up to {1000 * dropped:.2f} meV on the electrode "
+                                  "interfaces is left out of the vertices; the device is too "
+                                  "short for this spin cloud")
+            w[excl] = -1.0                              # below any w_min: never kept
+        _, kept = RG.partition(geom.xyz, centres, w,
                                assign="nearest", w_min=self.w_min if w_min is None else w_min,
                                r_cut=self.r_cut)
+        if len(excl):
+            kept = [np.setdiff1d(k, excl) for k in kept]
         return kept
 
     # -- build ------------------------------------------------------------------
@@ -1838,8 +1857,11 @@ class DFTDevice(_BuilderPlotMixin):
                                               required=self.weight == "mulliken")
             m_dev = np.asarray(moments, dtype=float)[np.asarray(orig, dtype=int)]
             if self.region == "disjoint":
-                w = RG.atom_delta_weights(H_sp) if self.weight == "delta" else np.abs(m_dev)
-                kept = self._nearest_regions(g_sp, anchors, w)
+                wd = RG.atom_delta_weights(H_sp)
+                w = wd if self.weight == "delta" else np.abs(m_dev)
+                interfaces = np.union1d(info["left_orbs"], info["right_orbs"])
+                kept = self._nearest_regions(g_sp, anchors, w, exclude_orbs=interfaces,
+                                             delta_weights=wd)
                 region_kw = [dict(region="atom_mask",
                                   atom_mask=[int(orig[a]) for a in kept[k]]) for k in range(2)]
             else:

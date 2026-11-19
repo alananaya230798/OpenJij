@@ -1,0 +1,59 @@
+SolutionMethod        Diagon
+SystemName  device
+SystemLabel device
+==================================================
+==================================================
+# for spin polarized Calculations
+Spin polarized
+Spin.Fix True
+Spin.Total  2
+==================================================
+==================================================
+# Details about DFT
+PAO.BasisSize   SZP
+XC.functional   GGA
+XC.authors      PBE
+ElectronicTemperature 50 K
+Mesh.Cutoff 400 Ry
+==================================================
+==================================================
+# K-points
+%block kgrid_Monkhorst_Pack
+ 9      0      0      0.0
+ 0      1      0      0.0
+ 0      0      1      0.0
+%endblock kgrid_Monkhorst_Pack
+==================================================
+==================================================
+# Structure
+%include device.fdf #Change to desired structure
+==================================================
+==================================================
+# SCF variables
+DM.MixSCF1   T
+MaxSCFIterations      500           # Maximum number of SCF iter
+DM.MixingWeight       0.05          # New DM amount for next SCF cycle
+DM.Tolerance          1.d-4         # Tolerance in maximum difference
+DM.UseSaveDM          true          # to use continuation files
+DM.NumberPulay        5
+==================================================
+==================================================
+WriteMullikenPop                1
+WriteBands                      .false.
+SaveRho                         .true.
+SaveDeltaRho                    .false.
+SaveHS                          .true.
+SaveElectrostaticPotential      .true.
+SaveTotalPotential              .false.
+WriteCoorXmol                   .false.
+WriteMDXmol                     .false.
+WriteMDhistory                  .false.
+WriteEigenvalues                .false.
+%block PDOS.kgrid_Monkhorst_Pack
+   50 0  0  0.0
+   0  1  0  0.0
+   0  0  1  0.0
+%endblock PDOS.kgrid_Monkhorst_Pack
+%block ProjectedDensityOfStates
+EF -2.00 2.00 0.050 200 eV
+%endblock ProjectedDensityOfStates

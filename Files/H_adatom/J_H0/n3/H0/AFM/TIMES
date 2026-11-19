@@ -1,0 +1,91 @@
+
+timer: Number of nodes = 40
+timer: Number of threads per node = 1
+timer: Busiest calculating node was node = 0
+timer: Times refer to node = 0
+timer: Total elapsed wall-clock time (sec) =     1285.609
+timer: CPU times (sec):
+Calc: Sum, Avge, myNode, Avg/Max =   51424.251    1285.606    1285.609   1.000
+Comm: Sum, Avge, myNode, Avg/Max =       0.000       0.000       0.000     NaN
+Tot:  Sum, Avge, myNode, Avg/Max =   51424.251    1285.606    1285.609   1.000
+Program times printed if >  0.000E+00 of total
+
+Program            Calls     Prg.com  Prg.com     Prg.tot  Prg.tot Nod.avg
+                                     /Tot.com             /Tot.tot/Nod.max
+siesta                 1       0.000   0.0000    1285.609   1.0000   1.000
+Setup                  1       0.000   0.0000       0.342   0.0003   0.993
+bands                  1       0.000   0.0000       0.000   0.0000   0.959
+KSV_init               1       0.000   0.0000       0.000   0.0000   0.982
+IterGeom               1       0.000   0.0000     525.586   0.4088   1.000
+geom_init              1       0.000   0.0000      31.034   0.0241   1.000
+state_init             1       0.000   0.0000       0.382   0.0003   0.873
+hsparse                1       0.000   0.0000       0.024   0.0000   0.901
+overlap                1       0.000   0.0000       0.023   0.0000   0.770
+Setup_H0               1       0.000   0.0000      15.774   0.0123   0.999
+naefs                  2       0.000   0.0000       0.005   0.0000   0.972
+dnaefs                 1       0.000   0.0000       0.004   0.0000   0.972
+two-body               1       0.000   0.0000       0.000   0.0000   0.837
+MolMec                 2       0.000   0.0000       0.000   0.0000   0.626
+kinefsm                2       0.000   0.0000       0.048   0.0000   0.755
+nlefsm                 2       0.000   0.0000       0.556   0.0004   0.746
+DHSCF_Init             1       0.000   0.0000      15.516   0.0121   0.997
+DHSCF1                 1       0.000   0.0000       0.164   0.0001   0.983
+InitMesh               1       0.000   0.0000       0.161   0.0001   0.983
+INITMESH               3       0.000   0.0000       2.500   0.0019   0.938
+DHSCF2                 1       0.000   0.0000      15.348   0.0119   0.997
+REMESH                 1       0.000   0.0000       2.838   0.0022   0.947
+BuildDISTR             2       0.000   0.0000       2.500   0.0019   0.938
+meshCom-Ca             3       0.000   0.0000       0.000   0.0000   0.666
+REORD                 14       0.000   0.0000       1.749   0.0014   0.914
+PHION                  1       0.000   0.0000       2.924   0.0023   0.850
+dscfComm               1       0.000   0.0000       0.256   0.0002   0.523
+COMM_BSC              42       0.000   0.0000      16.034   0.0125   0.906
+POISON                 6       0.000   0.0000      23.735   0.0185   0.997
+fft                   12       0.000   0.0000      19.123   0.0149   0.981
+setup_H                3       0.000   0.0000      44.110   0.0343   1.000
+DHSCF                  5       0.000   0.0000     272.593   0.2120   0.996
+DHSCF3                 5       0.000   0.0000     256.828   0.1998   1.000
+rhoofd                 5       0.000   0.0000       7.799   0.0061   0.951
+OtoM                   6       0.000   0.0000       0.145   0.0001   0.560
+XC                     5       0.000   0.0000      21.248   0.0165   0.939
+GXC-CellXC             5       0.000   0.0000      14.072   0.0109   0.950
+gridxc@cellXC          5       0.000   0.0000      14.072   0.0109   0.950
+vmat                   4       0.000   0.0000       6.650   0.0052   0.912
+MtoO                   4       0.000   0.0000       0.546   0.0004   0.502
+IterSCF                2       0.000   0.0000     460.289   0.3580   0.999
+compute_dm             2       0.000   0.0000     430.315   0.3347   1.000
+diagon                 2       0.000   0.0000     430.307   0.3347   1.000
+c-eigval              20       0.000   0.0000     196.013   0.1525   1.000
+c-buildHS             20       0.000   0.0000       0.330   0.0003   0.769
+cdiag                 92       0.000   0.0000     944.255   0.7345   1.000
+cdiag1                92       0.000   0.0000      29.645   0.0231   0.981
+cdiag2                92       0.000   0.0000      91.042   0.0708   0.998
+cdiag3                92       0.000   0.0000     764.197   0.5944   1.000
+c-eigvec              20       0.000   0.0000     199.334   0.1551   1.000
+cdiag4                72       0.000   0.0000      48.994   0.0381   0.992
+c-buildD              20       0.000   0.0000      34.897   0.0271   0.997
+MIXER                  1       0.000   0.0000       0.004   0.0000   0.653
+PostSCF                1       0.000   0.0000      32.925   0.0256   1.000
+FINAL_HF               1       0.000   0.0000      32.925   0.0256   1.000
+DHSCF4                 1       0.000   0.0000      15.765   0.0123   0.940
+dfscf                  1       0.000   0.0000       8.244   0.0064   0.891
+overfsm                1       0.000   0.0000       0.028   0.0000   0.773
+writeHSX               1       0.000   0.0000       1.014   0.0008   0.079
+state_analysis         1       0.000   0.0000       0.037   0.0000   0.129
+siesta_move            1       0.000   0.0000       0.000   0.0000   0.807
+Analysis               1       0.000   0.0000     759.554   0.5908   1.000
+pdos                   1       0.000   0.0000     561.202   0.4365   0.991
+optical                1       0.000   0.0000       0.000   0.0000   0.758
+MPI total              0       0.000   1.0000       0.000   0.0000
+
+Definitions:
+Program: Name of a time-profiled routine (or code section)
+Calls:   Number of profiled calls to a program
+Prg.com: CPU time in communications in one program in one node
+Tot.com: CPU time in communications in all progs. in one node
+Prg.tot: total CPU time in one program in one node
+Tot.tot: total CPU time in all programs in one node
+Nod.avg: average calculation time in one program across nodes
+Nod.max: maximum calculation time in one program across nodes
+Calculation time: CPU time excluding communications
+ 

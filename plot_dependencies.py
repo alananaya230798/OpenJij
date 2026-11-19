@@ -189,6 +189,164 @@ def _legend_below(ax, handles):
               borderaxespad=5.5, ncol=min(len(handles), 5), frameon=False)
 
 
+def optional_import(module: str, purpose: str = "this plot"):
+    """Import an optional plotting library, with a clear message if it is missing."""
+    try:
+        return importlib.import_module(module)
+    except ImportError as err:
+        raise ImportError(f"{purpose} needs the optional package '{module}' "
+                          f"(pip install {module.split('.')[0]})") from err
+
+
+def _dir(run_or_dir) -> Path:
+    return run_or_dir.results_dir if isinstance(run_or_dir, ExchangeRun) else Path(run_or_dir)
+
+
+# ===========================================================================
+# Plots from the results folder (any method, also results from the cluster)
+# ===========================================================================
+def _orbital_classes(geo, side):
+    """Masks of the vertex orbitals: carbon pz, adatom H, d (only nonempty classes)."""
+    names = geo[f"orbital_names_{side}"]
+    Z = geo["Z"][geo[f"atoms_{side}"]]
+    h = Z == 1
+    classes = {"C-pz": np.array(["pz" in n for n in names]) & ~h,
+               "H": h,
+               "d": np.array(["d" in n for n in names]) & ~h}
+    return {k: v for k, v in classes.items() if v.any()}
+
+
+def plot_orbital_contributions(run_or_dir, ax=None):
+    """Bar chart of J from pairs of orbital classes (rows i, columns j)."""
+    res, geo, cfg = load_results(_dir(run_or_dir))
+    J_orb = res["J_orb_meV"]
+    ci, cj = _orbital_classes(geo, "i"), _orbital_classes(geo, "j")
+    labels, values = [], []
+    for a, mi in ci.items():
+        for b, mj in cj.items():
+            labels.append(f"{a}-{b}")
+            values.append(J_orb[np.ix_(mi, mj)].sum())
+    J_total = float(res["J_meV"])
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    ax.bar(labels, values)
+    ax.axhline(0, color="black", lw=0.8)
+    ax.axhline(J_total, color="red", ls="--", label=rf"Total $J$ = {J_total:.4f} meV")
+    ax.set_ylabel("Exchange contribution [meV]")
+    ax.set_title(f"{str(res['method'])}: orbital-class contributions")
+    ax.legend()
+    plt.setp(ax.get_xticklabels(), rotation=30)
+    plt.tight_layout()
+    return dict(zip(labels, values))
+
+
+def plot_exchange_kernel(run_or_dir):
+    """Weighted kernel along the contour: total, orbital classes, and the contour."""
+    d = _dir(run_or_dir)
+    res, geo, cfg = load_results(d)
+    z = res["energies"]
+    K = res["weighted_kernel_kE"][0]
+    fig, ax = plt.subplots(3, 1, figsize=(6, 6), sharex=True)
+    ax[0].scatter(z.real, 1000 * K.imag, s=15, c=z.imag, label="Im(K)")
+    ax[0].scatter(z.real, 1000 * K.real, s=15, c=z.imag, marker="x", label="Re(K)")
+    ax[0].set_ylabel("Total weighted [meV]")
+    ax[0].legend()
+    korb = d / "weighted_orbital_kernel.npy"
+    if "weighted_class_kernel_kE" in res.files:          # per-energy kernel per class pair
+        Kc = res["weighted_class_kernel_kE"][0]
+        names_i, names_j = res["class_names_i"], res["class_names_j"]
+        for a, na in enumerate(names_i):
+            for b, nb in enumerate(names_j):
+                if np.abs(Kc[:, a, b]).max() > 0:
+                    ax[1].scatter(z.real, 1000 * Kc[:, a, b].imag, s=10, label=f"{na}-{nb}")
+        ax[1].legend(fontsize=7)
+    elif korb.is_file():                                 # full orbital kernel (large)
+        K_orb = np.load(korb, mmap_mode="r")[0]
+        ci, cj = _orbital_classes(geo, "i"), _orbital_classes(geo, "j")
+        for a, mi in ci.items():
+            for b, mj in cj.items():
+                Kab = np.asarray(K_orb[:, mi][:, :, mj]).sum(axis=(1, 2))
+                if np.abs(Kab).max() > 0:
+                    ax[1].scatter(z.real, 1000 * Kab.imag, s=10, label=f"{a}-{b}")
+        ax[1].legend(fontsize=7)
+    ax[1].set_ylabel("Orbital weighted K [meV]")
+    sc = ax[2].scatter(z.real, z.imag, c=z.imag, cmap="viridis", s=15)
+    ax[2].set_xlabel("Re(E) [eV]")
+    ax[2].set_ylabel("Im(E) [eV]")
+    for a in ax:
+        plt.colorbar(sc, ax=a, label="Im(E) [eV]")
+    plt.tight_layout()
+    return fig
+
+
+def _atomic(res, geo):
+    J_orb = res["J_orb_meV"]
+    xyz = geo["xyz"]
+    ai, aj = geo["atoms_i"].astype(int), geo["atoms_j"].astype(int)
+    Ji, Jj = np.zeros(len(xyz)), np.zeros(len(xyz))
+    np.add.at(Ji, ai, J_orb.sum(axis=1))
+    np.add.at(Jj, aj, J_orb.sum(axis=0))
+    selected = np.union1d(ai, aj)
+    return Ji, Jj, 0.5 * (Ji + Jj), selected
+
+
+def atomic_contributions_table(run_or_dir) -> None:
+    """Print the atom-resolved contributions J_i, J_j and their symmetric average."""
+    res, geo, cfg = load_results(_dir(run_or_dir))
+    Ji, Jj, Ja, selected = _atomic(res, geo)
+    xyz, Z = geo["xyz"], geo["Z"]
+    print(f"{'Atom':>6} {'Z':>4} {'x [Å]':>10} {'y [Å]':>10} {'J_i [meV]':>14} {'J_j [meV]':>14} {'J_a [meV]':>14}")
+    print("-" * 78)
+    for a in selected:
+        print(f"{a:6d} {Z[a]:4d} {xyz[a, 0]:10.3f} {xyz[a, 1]:10.3f} {Ji[a]:14.6f} {Jj[a]:14.6f} {Ja[a]:14.6f}")
+    print("-" * 78)
+    print(f"Total J = {float(res['J_meV']):.6f} meV")
+
+
+def plot_atomic_contributions(run_or_dir, label_top: int = 5, cmap: str = "coolwarm"):
+    """Map of the atom-resolved contributions (top view and side view)."""
+    from scipy.spatial import cKDTree
+    from matplotlib.collections import LineCollection
+    res, geo, cfg = load_results(_dir(run_or_dir))
+    Ji, Jj, Ja, selected = _atomic(res, geo)
+    xyz = geo["xyz"]
+    vals = Ja[selected]
+    lim = np.max(np.abs(vals)) if np.any(vals) else 1.0
+    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(12, 5), sharex=True,
+                                  gridspec_kw=dict(height_ratios=(3, 1)))
+    pairs = np.array(list(cKDTree(xyz).query_pairs(r=1.78)), dtype=int).reshape(-1, 2)
+    if len(pairs):
+        ax.add_collection(LineCollection(xyz[pairs, :2], colors="0.78", linewidths=0.8, zorder=1))
+    ax.scatter(xyz[:, 0], xyz[:, 1], s=18, facecolor="0.82", edgecolor="0.6", linewidth=0.2, zorder=2)
+    sizes = 45 + 140 * (np.abs(vals) / lim) ** 0.6
+    sc = ax.scatter(xyz[selected, 0], xyz[selected, 1], c=vals, s=sizes, cmap=cmap,
+                    vmin=-lim, vmax=lim, edgecolors="black", linewidths=0.35, zorder=3)
+    defects = geo["defect_atoms"]
+    ax.scatter(xyz[defects, 0], xyz[defects, 1], s=80, c="red", marker="X",
+               edgecolors="black", linewidths=0.8, zorder=5, label="anchors")
+    adatoms = geo["adatom_atoms"] if "adatom_atoms" in geo.files else []
+    if len(adatoms):
+        ax.scatter(xyz[adatoms, 0], xyz[adatoms, 1], s=60, c="cyan", edgecolors="black",
+                   linewidths=0.8, zorder=6, label="adatoms")
+        ax2.scatter(xyz[adatoms, 0], xyz[adatoms, 2], s=60, c="cyan", edgecolors="black", zorder=6)
+    for a in selected[np.argsort(np.abs(vals))[::-1][:label_top]]:
+        ax.annotate(f"{Ja[a]:.3f}", xyz[a, :2], fontsize=7, xytext=(3, 3), textcoords="offset points")
+    plt.colorbar(sc, ax=ax, label=r"$J_a$ [meV]")
+    ax.set_aspect("equal")
+    ax.set_ylabel("y [Å]")
+    ax.set_title(f"{str(res['method'])}: atomic contributions, J = {float(res['J_meV']):.4f} meV")
+    ax.legend(fontsize=7, loc="upper right")
+    ax2.scatter(xyz[:, 0], xyz[:, 2], s=10, c="0.7")
+    ax2.scatter(xyz[selected, 0], xyz[selected, 2], c=vals, s=sizes / 3, cmap=cmap, vmin=-lim, vmax=lim)
+    ax2.set_xlabel("x [Å]")
+    ax2.set_ylabel("z [Å]")
+    plt.tight_layout()
+    return fig
+
+
+# ===========================================================================
+# Plots that need the run (device, vertices, DOS)
+# ===========================================================================
 def _zoom(ax, v, window, ylim=None):
     """Axis limits: anchors +/- window (Ang) in x and y; window None = whole device
     (y fitted to the atoms +/- 3 Ang instead of the vacuum of the cell)."""
@@ -204,7 +362,7 @@ def _zoom(ax, v, window, ylim=None):
 
 
 def plot_setup(src, method: Optional[str] = None, ylim=None, show_regions: bool = True,
-               region_lw: float = 0.25, region_style: str = "rings", window=None):
+               region_lw: float = 1.0, region_style: str = "rings", window=None):
     """Device geometry with the vertex regions (red / blue rings, Mulliken moment of every
     defect cloud inside each region in the legend when available), the electrodes
     (green rings) and the anchors (dashed circles).
@@ -215,7 +373,7 @@ def plot_setup(src, method: Optional[str] = None, ylim=None, show_regions: bool 
     v = _view(src, method)
     g = v.g
     fig, ax = plot_atoms(g, annotate=False, size=12)
-    handles=[]
+    handles = [] 
     if show_regions:
         labels = ["region i", "region j"]
         rep = v.info.get("region_moments_muB")
@@ -225,8 +383,8 @@ def plot_setup(src, method: Optional[str] = None, ylim=None, show_regions: bool 
                 labels[k] += ", m = " + " / ".join(f"{x:+.3f}" for x in vals) + " muB"
         handles += draw_regions(ax, g, region_atoms(v), lw=region_lw, labels=labels,
                                 style=region_style)
-    handles += draw_electrodes(ax, v)
     handles += draw_anchors(ax, v)
+    handles += draw_electrodes(ax, v)
     _zoom(ax, v, window, ylim)
     _legend_below(ax, handles)
     ax.set_title(f"{v.method}: device ({v.builder}), region {v.region}, "
@@ -238,7 +396,7 @@ plot_regions = plot_setup        # merged into plot_setup (kept as an alias)
 
 
 def plot_vertices(src, method: Optional[str] = None, ylim=None, vabs: float = 0.25,
-                  show_regions: bool = True, region_lw: float = 0.25, both_regions: bool = True,
+                  show_regions: bool = True, region_lw: float = 1.0, both_regions: bool = True,
                   region_style: str = "rings", window: Optional[float] = 25.0):
     """Diagonal spin splitting of the two vertices per atom (pz, s and dz orbitals).
 
