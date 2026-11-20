@@ -34,7 +34,7 @@ def parse(argv=None):
     p.add_argument("defect_i", help="label of defect i (key of DEFECT_FILES)")
     p.add_argument("defect_j", help="label of defect j")
     p.add_argument("n_dist", type=int, help="cells between the anchors / DFT separation label")
-    p.add_argument("--basis", default="pz")
+    p.add_argument("--basis", default="pz", help="pz1, pz, pz+dz, pz+dpi, pz+dpi+dz2[R] (local dz2, R=5 Ang default), full")
     p.add_argument("--inputs", default="defect_files.py", help="input file (.py or .json)")
     p.add_argument("--cc-file", default="./CC_40eV.TSCCEQ-Elec", help="TSCCEQ contour file")
     p.add_argument("--folder", default=None, help="results folder (default H_<system>_<basis>_<method>)")
@@ -49,8 +49,18 @@ def parse(argv=None):
                    help="vertex region (default disjoint; 'all' was removed)")
     p.add_argument("--region-assign", default=None, choices=("dominant", "nearest"))
     p.add_argument("--region-weight", default="delta", choices=("delta", "mulliken"))
-    p.add_argument("--region-wmin", type=float, default=1e-4)
-    p.add_argument("--region-rcut", type=float, default=None)
+    p.add_argument("--region-wmin", type=float, default=1e-3,
+                   help="1e-3 eV for delta (recommended); fast option: --region-weight mulliken with 1e-3 muB")
+    p.add_argument("--vertex", default="full", choices=("full", "onsite"),
+                   help="full region block (default) or atomic on-site blocks (TB2J-style)")
+    p.add_argument("--reference", default="FM", choices=("FM", "AFM", "both"),
+                   help="liechtenstein: spin-polarized reference (DEVICE_FILES FM / AFM)")
+    p.add_argument("--periodic", action="store_true",
+                   help="liechtenstein: periodic DFT cell with its k grid instead of the device")
+    p.add_argument("--no-time-reversal", action="store_true",
+                   help="periodic mode: use the full k grid (no k/-k folding)")
+    p.add_argument("--kgrid", type=int, default=None, help="periodic mode: k points (default: DFT grid)")
+    p.add_argument("--temperature-check", default="error", choices=("error", "warn", "off"))
     p.add_argument("--sparsity-atol", type=float, default=1e-6)
     p.add_argument("--radius", type=float, default=7.5)
     p.add_argument("--vertices", default="own", choices=("own", "region"))
@@ -104,7 +114,10 @@ def main(argv=None):
                        dos_eta=a.dos_eta, dos_orbitals=None if a.dos_total else "region",
                        sparsity_atol=a.sparsity_atol, region_assign=a.region_assign,
                        region_weight=a.region_weight, region_wmin=a.region_wmin,
-                       region_rcut=a.region_rcut)
+                       vertex=a.vertex, temperature_check=a.temperature_check,
+                       **(dict(reference=a.reference, periodic=a.periodic,
+                               time_reversal=not a.no_time_reversal, kgrid=a.kgrid)
+                          if a.method in ("liechtenstein", "lkag") else {}))
     if run is not None:
         print(run.summary(), flush=True)
         print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  done", flush=True)

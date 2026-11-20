@@ -57,7 +57,7 @@ Vertex regions (all builders)
     significant (regions.py). Assignment 'dominant' (larger own single-defect
     ||Delta|| or |m|; default of the single-defect builders) or 'nearest' (Voronoi;
     the only rule of DFTDevice). Weight threshold w_min (eV for 'delta', muB for
-    'mulliken') and distance cutoff r_cut. 'radius', 'square' and 'atom_mask' remain,
+    'mulliken'); no distance cutoff (r_cut was removed). 'radius', 'square' and 'atom_mask' remain,
     but no builder accepts overlapping vertices. The Mulliken moment captured by
     every region is reported (siesta.out, else the density matrix).
     With downfolding, the carbons coupled to each adatom must belong to its own
@@ -579,21 +579,24 @@ class PristineTiled(_BuilderPlotMixin):
                 unpolarized, or polarized with negligible splitting.
     defects   : (spec_i, spec_j), Adatom/Heteroatom from defects.py.
     n_dist    : cells between the two anchors.
-    basis     : basis used to prune H0 ('pz', 'pz1', 'pz+dz', ...).
+    basis     : basis used to prune H0 ('pz', 'pz1', 'pz+dz', 'pz+dpi', 'pz+dpi+dz2[R]').
+                For the local dz2 basis H0 must carry dz2 everywhere (prune_ham does it);
+                the host keeps dz2 within R of the device anchors, the electrodes none.
     N_imp     : None -> automatic layout from the defect supercell sizes.
                 int  -> legacy layout N = 2*(N_imp+N_buffer)+1+n_dist,
                         anchor i in cell N_imp+N_buffer (current scripts).
     N_buffer  : extra pristine cells between defect supports and electrodes.
     n_tile    : electrode cells; None -> smallest with nsc <= 3.
     region    : vertex region. 'disjoint' (default): every device atom is assigned to
-                one impurity (assign) and kept if its weight >= w_min and it lies within
-                r_cut of the centre (regions.py); 'radius' / 'square' (radius = sphere
+                one impurity (assign) and kept if its weight >= w_min (regions.py; no
+                distance cutoff); 'radius' / 'square' (radius = sphere
                 radius / xy half-side, Ang) / 'atom_mask'. Overlapping regions are
                 rejected for every mode ('all' was removed: it double counts).
     assign    : 'dominant' (default; larger own single-defect weight) or 'nearest'
                 (closest impurity centre, Voronoi).
     weight    : 'delta' (||H_up - H_dn|| per atom, eV, default) or 'mulliken' (|m_a|, muB).
-    w_min, r_cut : weight threshold (eV or muB) and distance cutoff (Ang, None = none).
+    w_min     : weight threshold (eV for 'delta', muB for 'mulliken'). Recommended:
+                1e-3 eV (default of run_exchange); fast option 'mulliken' with 1e-3 muB.
     mulliken_column : spin column of read_charge('mulliken') in siesta.out.
                 The Mulliken moment captured by every region is always reported
                 (siesta.out next to the fdf, else the density matrix).
@@ -618,8 +621,8 @@ class PristineTiled(_BuilderPlotMixin):
                  atom_mask=None, nm_tol: float = 1e-3, verbose: bool = True,
                  downfold: bool = False, align_radius: Optional[float] = None,
                  ends_tol: float = 5*1e-3, overlap_tol: float = 1e-3,
-                 assign: Optional[str] = None, weight: str = "delta", w_min: float = 1e-4,
-                 r_cut: Optional[float] = None, mulliken_column: int = 2):
+                 assign: Optional[str] = None, weight: str = "delta", w_min: float = 1e-3,
+                 mulliken_column: int = 2):
         if len(defects) != 2:
             raise ValueError("defects must contain two specs (i, j)")
         if int(n_dist) < 0:
@@ -631,6 +634,10 @@ class PristineTiled(_BuilderPlotMixin):
         self.specs = tuple(defects)
         self.n_dist = int(n_dist)
         self.basis, self.axis = basis, int(axis)
+        self.local_dz2 = _JD().is_local_basis(basis)
+        if self.local_dz2 and not _JD().has_dz2(self.H0):
+            raise ValueError(f"basis '{basis}' needs the pristine cell with dz2 on every atom: "
+                             "prune it with prune_ham(..., basis='%s') (returns pz+dz)" % basis)
         self.N_imp, self.N_buffer = N_imp, int(N_buffer)
         self.n_tile = electrode_tiling(self.H0, axis) if n_tile is None else int(n_tile)
         self.tol, self.site_tol = tol, site_tol
@@ -640,7 +647,7 @@ class PristineTiled(_BuilderPlotMixin):
             raise ValueError("assign must be 'dominant' or 'nearest'")
         if weight not in ("delta", "mulliken"):
             raise ValueError("weight must be 'delta' or 'mulliken'")
-        self.weight, self.w_min, self.r_cut = weight, float(w_min), r_cut
+        self.weight, self.w_min = weight, float(w_min)
         self.mulliken_column = int(mulliken_column)
         self.nm_tol, self.verbose = nm_tol, verbose
         self.downfold, self.align_radius = bool(downfold), align_radius
@@ -694,10 +701,38 @@ class PristineTiled(_BuilderPlotMixin):
         anchors = [spec.host_anchor(self.H0.geometry, cell=c, axis=self.axis,
                                     tol=self.site_tol)
                    for spec, c in zip(self.specs, (lay["c_i"], lay["c_j"]))]
+        if self.local_dz2:
+            H = _JD().trim_dz2(H, self._dz2_device_atoms(H, anchors, lay))
         return H, anchors
+
+    def _dz2_device_atoms(self, H, anchors, lay):
+        """Local dz2 basis: device atoms that carry dz2. They are the atoms within R (xy)
+        of the anchor IN EACH SINGLE-DEFECT FILE, mapped onto the device; the defect files
+        then take dz2 on the atoms that land on these (dz2_atoms_from_host), so host and
+        defects agree atom by atom."""
+        import sisl
+        JD = _JD()
+        _, R = JD.parse_basis(self.basis)
+        keep = set()
+        for spec, a in zip(self.specs, anchors):
+            r = spec.resolve()
+            g = sisl.get_sile(str(spec.file)).read_geometry()
+            loc = JD.local_dz2_atoms(g, R, [r.anchor])
+            m = JD.map_atoms_xy(g, r.anchor, H.geometry, a, loc, self.tol)
+            missing = sorted(set(loc) - set(m))
+            if missing:
+                raise ValueError(f"{spec.label}: atoms within the dz2 radius {R} Ang could not be "
+                                 f"mapped onto the device (file atoms {missing[:5]})")
+            keep |= set(m.values())
+        elec = np.concatenate(self._electrode_atoms(lay))
+        if keep & set(elec.tolist()):
+            raise ValueError("the dz2 region reaches the electrode cells; increase N_buffer")
+        return keep
 
     def _electrodes(self):
         elec = self.H0.tile(self.n_tile, self.axis)
+        if self.local_dz2:              # no anchor in the electrodes: pz + dxz + dyz
+            elec = _JD().trim_dz2(elec)
         return elec, elec.copy()
 
     # -- downfolding ---------------------------------------------------------
@@ -712,8 +747,10 @@ class PristineTiled(_BuilderPlotMixin):
         r = spec.resolve()
         H_full = _JD().read_hamiltonian(spec.file)
         # Pruned single-defect Hamiltonian without the adatom: mapping and alignment
+        dz2 = (JD.dz2_atoms_from_host(H_full.geometry, r.anchor, H, host_anchor, self.tol)
+               if self.local_dz2 else None)
         H_def, orig = JD.prepare_spin_basis(H_full, basis=self.basis,
-                                            remove_atoms=tuple(spec.adatoms()))
+                                            remove_atoms=tuple(spec.adatoms()), dz2_atoms=dz2)
         g, gh = H_def.geometry, H.geometry
         a_def = pruned_index(orig, r.anchor)
         shift_xy = gh.xyz[host_anchor, :2] - g.xyz[a_def, :2]
@@ -744,7 +781,7 @@ class PristineTiled(_BuilderPlotMixin):
         shift = float(np.vdot(s_def, delta).real / np.vdot(s_def, s_def).real)
         rms = float(np.sqrt(np.mean((delta - shift * s_def) ** 2)))
         return dict(H_full=H_full, H_def=H_def, orig=orig, amap=amap, mats=mats, S_def=S_def,
-                    shift=shift, rms=rms, shift_xy=shift_xy)
+                    shift=shift, rms=rms, shift_xy=shift_xy, dz2_atoms=dz2)
 
     def _downfold_data(self, spec, H, host_anchor, m=None):
         """Aligned downfolding data of one adatom, and its carbons on the device.
@@ -764,7 +801,8 @@ class PristineTiled(_BuilderPlotMixin):
         # Hydrogen blocks of the shifted single-defect Hamiltonian
         H_al = H_full.copy()
         H_al.shift(shift)                                   # H -> H + shift * S
-        hdata = JD.prepare_hydrogen_downfold(H_al, spec.index, basis=self.basis)
+        hdata = JD.prepare_hydrogen_downfold(H_al, spec.index, basis=self.basis,
+                                             dz2_atoms=m.get("dz2_atoms"))
 
         # Coupled carbons: single-defect orbitals -> device orbitals (same order)
         mapped = []
@@ -787,8 +825,7 @@ class PristineTiled(_BuilderPlotMixin):
             return f"square (half-side = {self.radius:.2f} Ang)"
         if self.region == "disjoint":
             unit = "eV" if self.weight == "delta" else "muB"
-            return (f"disjoint ({self.assign}, weight {self.weight} >= {self.w_min:g} {unit}"
-                    + (f", r_cut {self.r_cut:.2f} Ang" if self.r_cut is not None else "") + ")")
+            return f"disjoint ({self.assign}, weight {self.weight} >= {self.w_min:g} {unit})"
         return self.region + (f" (R = {self.radius:.2f} Ang)" if self.region == "radius" else "")
 
     # -- disjoint regions ----------------------------------------------------------
@@ -818,7 +855,7 @@ class PristineTiled(_BuilderPlotMixin):
             W[k, c["dev"][ok]] = w[ok]
             M[k, c["dev"][ok]] = c["moment"][ok]
         labels, kept = RG.partition(geom.xyz, self._centres(geom, anchors), W,
-                                    assign=self.assign, w_min=self.w_min, r_cut=self.r_cut,
+                                    assign=self.assign, w_min=self.w_min,
                                     protected=protected, names=[c["label"] for c in clouds])
         rep = RG.region_moment_report(
             {f"defect {'ij'[k]} ({c['label']}, {c['moment_source']})": M[k] for k, c in enumerate(clouds)},
@@ -1011,7 +1048,7 @@ class Superposition(PristineTiled):
                    align='far'; None -> farthest half of the mapped atoms.
     delta_scale  : multiplies every Delta (device and vertices); 1e-3 gives
                    the weak-coupling limit (LKAG -> RKKY check).
-    region, radius, atom_mask, assign, weight, w_min, r_cut : vertex region (see
+    region, radius, atom_mask, assign, weight, w_min : vertex region (see
                    PristineTiled; 'disjoint' by default). Regions must lie inside the
                    embedding and may not overlap.
     vertices     : vertices of 'liechtenstein_sup':
@@ -1062,7 +1099,10 @@ class Superposition(PristineTiled):
         if not H_full.spin.is_polarized:
             warnings.warn(f"{spec.label}: unpolarized defect Hamiltonian, Delta = 0")
         keep = spec.adatoms()
-        H_def, orig = JD.prepare_spin_basis(H_full, basis=self.basis, keep_orbitals=keep)
+        dz2 = (JD.dz2_atoms_from_host(H_full.geometry, r.anchor, Hhost_geom, host_anchor, self.tol)
+               if self.local_dz2 else None)
+        H_def, orig = JD.prepare_spin_basis(H_full, basis=self.basis, keep_orbitals=keep,
+                                            dz2_atoms=dz2)
         g = H_def.geometry
         anchor = pruned_index(orig, r.anchor)
         adatoms = [pruned_index(orig, a) for a in keep]
@@ -1483,7 +1523,10 @@ def map_single_defect_vertex(spec, H_device, device_anchor: int, basis: str = "p
     H_full = _JD().read_hamiltonian(spec.file)
     if not H_full.spin.is_polarized:
         raise ValueError(f"{spec.label}: single-defect file must be spin polarized")
-    H_def, orig = JD.prepare_spin_basis(H_full, basis=basis, keep_orbitals=spec.adatoms())
+    dz2 = (JD.dz2_atoms_from_host(H_full.geometry, r.anchor, H_device, device_anchor, tol)
+           if JD.is_local_basis(basis) else None)
+    H_def, orig = JD.prepare_spin_basis(H_full, basis=basis, keep_orbitals=spec.adatoms(),
+                                        dz2_atoms=dz2)
     g = H_def.geometry
     anchor = pruned_index(orig, r.anchor)
     dist = np.linalg.norm(g.xyz - g.xyz[anchor], axis=1)
@@ -1624,9 +1667,9 @@ class DFTDevice(_BuilderPlotMixin):
                      is given, else 'single'.
     region, radius, atom_mask : FM vertex region (device file): 'disjoint' (default:
                      every device atom goes to the NEAREST defect centre and is kept if
-                     its weight >= w_min and it lies within r_cut), 'radius', 'square'
+                     its weight >= w_min; no distance cutoff), 'radius', 'square'
                      (xy half-side = radius) or 'atom_mask'; never overlapping.
-    weight, w_min, r_cut : weight of region='disjoint': 'delta' (||H_up - H_dn|| of the
+    weight, w_min : weight of region='disjoint': 'delta' (||H_up - H_dn|| of the
                      FM device per atom, eV) or 'mulliken' (|m_a| of the FM device, muB).
     assign         : only 'nearest' (the own clouds are unknown in a two-defect device).
     single_region, single_radius, single_atom_mask : vertex region for
@@ -1653,14 +1696,14 @@ class DFTDevice(_BuilderPlotMixin):
                  geom_tol: float = 0.1, nm_tol: float = 1e-3, verbose: bool = True,
                  vertex_source: Optional[str] = None, ends_tol: float = 1e-3,
                  overlap_tol: float = 1e-4, assign: Optional[str] = None,
-                 weight: str = "delta", w_min: float = 1e-4, r_cut: Optional[float] = None,
+                 weight: str = "delta", w_min: float = 1e-3,
                  mulliken_column: int = 2):
         if assign not in (None, "nearest"):
             raise ValueError("DFTDevice only supports assign='nearest' (Voronoi): the own "
                              "clouds of the two defects are not known in a two-defect device")
         if weight not in ("delta", "mulliken"):
             raise ValueError("weight must be 'delta' or 'mulliken'")
-        self.weight, self.w_min, self.r_cut = weight, float(w_min), r_cut
+        self.weight, self.w_min = weight, float(w_min)
         self.mulliken_column = int(mulliken_column)
         region, single_region = RG.check_region(region), RG.check_region(single_region)
         if H0 is None:
@@ -1671,6 +1714,9 @@ class DFTDevice(_BuilderPlotMixin):
         self.nm_file = None if nm_file is None else Path(nm_file)
         device_file = self.file if self.file is not None else self.nm_file
         self.H0 = nonmagnetic(H0, nm_tol, "Pristine host H0")
+        if _JD().is_local_basis(basis):
+            # local dz2 basis: dz2 only near the anchors, never at the electrode interfaces
+            self.H0 = _JD().trim_dz2(self.H0)
         self.basis, self.axis = basis, int(axis)
         self.n_tile = electrode_tiling(self.H0, axis) if n_tile is None else int(n_tile)
         if defects is None:
@@ -1727,7 +1773,8 @@ class DFTDevice(_BuilderPlotMixin):
     def _load(self, file, keep, HamL, label):
         JD = _JD()
         H_full = _JD().read_hamiltonian(file)
-        H_dev, orig = JD.prepare_spin_basis(H_full, basis=self.basis, keep_orbitals=keep)
+        H_dev, orig = JD.prepare_spin_basis(H_full, basis=self.basis, keep_orbitals=keep,
+                                            dz2_centres=[s.resolve().anchor for s in self.specs])
         # align_defect_to_electrodes calls Hk(spin=...) on the electrode, which
         # recent sisl rejects for unpolarized matrices: give it a polarized copy.
         elec = HamL if HamL.spin.is_polarized else HamL.transform(spin="polarized")
@@ -1773,7 +1820,7 @@ class DFTDevice(_BuilderPlotMixin):
 
     def _nearest_regions(self, geom, anchors, weights, w_min=None, exclude_orbs=(),
                          delta_weights=None):
-        """Voronoi (nearest centre) regions on the device atoms, with w_min and r_cut.
+        """Voronoi (nearest centre) regions on the device atoms, with w_min.
 
         Atoms of the electrode interfaces (exclude_orbs) never belong to a vertex: the
         lead self-energies sit there. The largest ||Delta|| dropped there is reported
@@ -1792,8 +1839,7 @@ class DFTDevice(_BuilderPlotMixin):
                                   "short for this spin cloud")
             w[excl] = -1.0                              # below any w_min: never kept
         _, kept = RG.partition(geom.xyz, centres, w,
-                               assign="nearest", w_min=self.w_min if w_min is None else w_min,
-                               r_cut=self.r_cut)
+                               assign="nearest", w_min=self.w_min if w_min is None else w_min)
         if len(excl):
             kept = [np.setdiff1d(k, excl) for k in kept]
         return kept

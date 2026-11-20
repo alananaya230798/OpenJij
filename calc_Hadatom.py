@@ -40,7 +40,7 @@ METHODS = {
 
 # Method
 METHOD = "rkky"              # rkky, rkky_sup, lkag_sup
-BASIS = "pz+dz"             # pz1, pz, pz+dz, full
+BASIS = "pz+dz"             # pz1, pz, pz+dz, pz+dpi, pz+dpi+dz2 (dz2 within 5 Ang of the anchors; "pz+dpi+dz2[6]" sets R), full
 N_IMP = 5
 N_BUFFER = 1
 NK = (1, 0, 0)
@@ -51,11 +51,20 @@ DOWNFOLD = True
 REGION = "disjoint"            # disjoint (default), radius, square, atom_mask ('all' removed)
 REGION_ASSIGN = None           # None -> 'dominant' (rkky, rkky_sup, lkag_sup) / 'nearest' (DFT devices)
 REGION_WEIGHT = "delta"        # 'delta' (||H_up-H_dn|| per atom, eV) or 'mulliken' (|m_a|, muB)
-REGION_WMIN = 1e-4             # threshold on the weight (eV or muB)
-REGION_RCUT = None             # Angstrom from the defect centre (None: no cutoff)
+REGION_WMIN = 1e-3             # threshold: 1e-3 eV (1 meV, recommended) for 'delta';
+                               # fast option: REGION_WEIGHT='mulliken' with 1e-3 muB
+                               # (no distance cutoff: REGION_RCUT was removed)
 DFT_RADIUS = 8.0               # only for REGION = 'radius' / 'square'
 SPARSITY_ATOL = 1e-6           # eliminate_zeros tolerance for every H/S read
 RKKY_NM_VERTEX_SOURCE = "fm"   # "fm" or "single"
+VERTEX = "full"                # 'full' (whole region block of H_up-H_dn) or 'onsite' (TB2J-style)
+
+# lkag (two-defect DFT files) only
+LKAG_REFERENCE = "FM"          # 'FM', 'AFM' or 'both' (both: J_FM, J_AFM and their mean)
+PERIODIC = False               # True: periodic DFT cell with its k grid (no electrodes)
+TIME_REVERSAL = True           # periodic mode: fold k and -k exactly
+KGRID = None                   # periodic mode: None -> kgrid_Monkhorst_Pack of the DFT file
+TEMPERATURE_CHECK = "error"    # contour T vs ElectronicTemperature: 'error', 'warn', 'off'
 
 # Electrode
 PRISTINE_FILE = HOME / "Elec/siesta/siesta.fdf"
@@ -81,9 +90,10 @@ defect_dict = {
 
 # Two-defect DFT Hamiltonian templates. Change these to your actual directories.
 # Supported placeholders: {defect_i}, {defect_j}, {n_dist}, {system_name}
-# FM: spin-polarized FM two-H device; NM: nonmagnetic two-H device.
+# FM / AFM: spin-polarized FM / AFM two-H device; NM: nonmagnetic two-H device.
 DEVICE_FILES = {
     "FM": str(HOME / "J_{defect_i}/n{n_dist}/{defect_j}/FM/siesta_FM.fdf"),
+    "AFM": str(HOME / "J_{defect_i}/n{n_dist}/{defect_j}/AFM/siesta_AFM.fdf"),
     "NM": str(HOME / "J_{defect_i}/n{n_dist}/{defect_j}/NM/siesta_NM.fdf"),
 }
 
@@ -112,6 +122,12 @@ if IS_DFT_DEVICE:
         results_name += f"_{RKKY_NM_VERTEX_SOURCE}"
 if EFFECTIVE_DOWNFOLD:
     results_name += "_downfold"
+if METHOD == "lkag" and PERIODIC:
+    results_name += "_periodic"
+if METHOD == "lkag" and LKAG_REFERENCE == "AFM":
+    results_name += "_AFMref"
+if VERTEX == "onsite":
+    results_name += "_onsite"
 
 SAVE_DOS = False                      # DOS computed with all MPI ranks inside run_exchange
 DOS_ENERGIES = np.linspace(-0.25, 0.25, 51)   # eV around E_F (was -0.25..25 eV)
@@ -143,7 +159,7 @@ def main():
     # Resolve only the two-defect files needed by the selected method.
     required = []
     if METHOD == "lkag":
-        required = ["FM"]
+        required = {"FM": ["FM"], "AFM": ["AFM"], "both": ["FM", "AFM"]}[LKAG_REFERENCE]
     elif METHOD == "rkky_nm":
         required = ["NM"] + (["FM"] if RKKY_NM_VERTEX_SOURCE == "fm" else [])
 
@@ -188,17 +204,20 @@ def main():
         region_assign=REGION_ASSIGN,
         region_weight=REGION_WEIGHT,
         region_wmin=REGION_WMIN,
-        region_rcut=REGION_RCUT,
+        vertex=VERTEX,
+        temperature_check=TEMPERATURE_CHECK,
         sparsity_atol=SPARSITY_ATOL,
         # for rkky+nm 
         vertex_source=RKKY_NM_VERTEX_SOURCE if METHOD == "rkky_nm" else None,
         builder_kwargs={"axis": TRANSPORT_AXIS},
+        **(dict(reference=LKAG_REFERENCE, periodic=PERIODIC, time_reversal=TIME_REVERSAL,
+                kgrid=KGRID) if METHOD == "lkag" else {}),
         align=ALIGN,
         nk=NK,
         lead_eta=LEAD_ETA,
         self_energy_mode=SELF_ENERGY_MODE,
         orbital_resolved=True,
-        dos_energies=DOS_ENERGIES if SAVE_DOS else None,   # -> results_name/dos.npz
+        dos_energies=DOS_ENERGIES if (SAVE_DOS and not (METHOD == "lkag" and PERIODIC)) else None,
         write_results=True,
         verbose=True,
         comm=comm,
@@ -207,6 +226,15 @@ def main():
     # Nonroot MPI ranks return None and never generate duplicate figures.
     if run is None:
         return
+    if hasattr(run, "J_mean"):                 # LKAG_REFERENCE = 'both'
+        print(run.summary(), flush=True)
+        for r in (run.FM, run.AFM):
+            make_plots(r)
+        return
+    make_plots(run)
+
+
+def make_plots(run):
     # Save only THIS method's plots next to THIS method's numerical results.
     plot_dir = run.results_dir / "Plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -221,7 +249,7 @@ def main():
     #save_fig(plot_exchange_kernel(run.results_dir), "04_exchange_kernel", plot_dir)
     #save_fig(plot_atomic_contributions(run.results_dir), "05_atomic_contributions", plot_dir)
     
-    if SAVE_DOS:
+    if SAVE_DOS and run.dos is not None:
         fig, _curves = plot_dos(run,energies=DOS_ENERGIES )          # plots the curves computed in parallel
         save_fig(fig, "06_reference_DOS", plot_dir)
 

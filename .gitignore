@@ -21,5 +21,7 @@ dist/
 *.sh
 
 #Examples
+Examples
+Logs
 RKKY_calc_2B.py
 RKKY_calc_Hadatom.py

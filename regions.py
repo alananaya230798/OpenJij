@@ -18,7 +18,11 @@ Every atom a is first ASSIGNED to one impurity k, then KEPT if it is significant
     assignment 'dominant' : k = argmax_l w_l(a)   (own single-defect clouds; ties and
                             atoms outside every cloud -> nearest centre)
                'nearest'  : k = argmin_l |r_a - R_l|   (Voronoi cell of the centre R_l)
-    kept if   w_k(a) >= w_min   and   |r_a - R_k| <= r_cut (r_cut None: no cutoff)
+    kept if   w_k(a) >= w_min
+
+There is no distance cutoff (the former r_cut was removed): J follows the long tail of
+Delta, not the moment, and is not converged until the whole cell of the impurity is
+included (two-defect tests, n_dist = 3).
 
 The cells never overlap. 'dominant' needs the own cloud of each defect and is the
 default of the single-defect builders (PristineTiled, Superposition,
@@ -30,7 +34,12 @@ Weights
 -------
 'delta'    : w(a) = ||(H_up - H_dn)_aa||_F, Frobenius norm of the R=0 on-site block of
              atom a in the basis of the vertex (eV); w_min in eV.
+             Recommended default w_min = 1e-3 eV (1 meV): identical to 1e-4 eV in the
+             two-defect tests. 1e-2 eV is NOT recommended (up to +12 % with the AFM
+             reference).
 'mulliken' : w(a) = |m_a|, Mulliken spin moment (mu_B) of atom a; w_min in mu_B.
+             Fast option: w_min = 1e-3 mu_B keeps J within 1.3 % and uses 30-45 %
+             fewer vertex orbitals (two-defect tests, pz+dz).
 
 The Mulliken moment captured by each region is always reported (both weights): it
 is read from siesta.out next to the fdf file (sisl stdoutSileSiesta, final
@@ -48,7 +57,10 @@ from typing import Dict, Optional, Sequence
 import numpy as np
 
 __all__ = ["REGION_MODES", "atom_delta_weights", "mulliken_moments", "moments_or_none", "partition",
-           "check_protected", "region_moment_report", "format_moment_report"]
+           "check_protected", "region_moment_report", "format_moment_report", "onsite_vertex",
+           "check_vertex"]
+
+VERTEX_MODES = ("full", "onsite")
 
 REGION_MODES = ("disjoint", "radius", "square", "atom_mask")
 REMOVED_ALL = ("region='all' was removed: overlapping vertices double count the "
@@ -164,8 +176,8 @@ def moments_or_none(fdf, na: Optional[int] = None, column: int = 2, required: bo
 # Partition
 # ---------------------------------------------------------------------------
 def partition(xyz, centers, weights, assign: str = "dominant", w_min: float = 1e-4,
-              r_cut: Optional[float] = None, protected: Optional[Sequence] = None,
-              names: Optional[Sequence[str]] = None):
+              protected: Optional[Sequence] = None,
+              names: Optional[Sequence[str]] = None, periodic=None, **removed):
     """Disjoint regions on a set of atoms.
 
     xyz      : (na, 3) atom positions (device frame)
@@ -174,10 +186,17 @@ def partition(xyz, centers, weights, assign: str = "dominant", w_min: float = 1e
                'nearest' with own clouds) or (na,) one total weight ('nearest')
     protected: per impurity, atoms that must belong to it (e.g. carbons coupled to a
                downfolded adatom); they are kept whatever their weight, and an error
-               is raised if they are assigned elsewhere or lie beyond r_cut.
+               is raised if they are assigned elsewhere.
+    periodic : None, or (axis, length): distances use the minimum image along that
+               lattice axis (periodic two-defect cells, Periodic_Exchange.py).
     Returns (labels, kept): labels[a] = impurity of atom a (assignment), kept[k] =
     sorted atom indices of region k.
     """
+    if "r_cut" in removed or "rcut" in removed:
+        raise TypeError("r_cut was removed: regions have no distance cutoff (J is not "
+                        "converged until the whole cell is included); use w_min")
+    if removed:
+        raise TypeError(f"unexpected arguments {sorted(removed)}")
     xyz = np.asarray(xyz, dtype=float)
     C = np.atleast_2d(np.asarray(centers, dtype=float))
     K, na = len(C), len(xyz)
@@ -188,7 +207,11 @@ def partition(xyz, centers, weights, assign: str = "dominant", w_min: float = 1e
         W = np.broadcast_to(W, (K, na))
     if W.shape != (K, na):
         raise ValueError(f"weights must have shape ({K}, {na})")
-    dist = np.linalg.norm(xyz[None, :, :] - C[:, None, :], axis=2)   # (K, na)
+    diff = xyz[None, :, :] - C[:, None, :]
+    if periodic is not None:
+        ax, L = int(periodic[0]), float(periodic[1])
+        diff[..., ax] = (diff[..., ax] + L / 2) % L - L / 2          # minimum image
+    dist = np.linalg.norm(diff, axis=2)                                # (K, na)
     nearest = np.argmin(dist, axis=0)
     if assign == "nearest":
         labels = nearest
@@ -202,8 +225,6 @@ def partition(xyz, centers, weights, assign: str = "dominant", w_min: float = 1e
         raise ValueError("assign must be 'dominant' or 'nearest'")
     rows = np.arange(na)
     keep = W[labels, rows] >= w_min
-    if r_cut is not None:
-        keep &= dist[labels, rows] <= r_cut
     kept = []
     names = [f"impurity {k}" for k in range(K)] if names is None else list(names)
     prot = [np.asarray(p, dtype=int) for p in (protected or [()] * K)]
@@ -218,10 +239,6 @@ def partition(xyz, centers, weights, assign: str = "dominant", w_min: float = 1e
                     f"assigned to another impurity (closest at "
                     f"{dist[k, wrong].min():.2f} Ang). The impurities are closer than the "
                     "downfolding range allows: increase the distance or use downfold=False.")
-            if r_cut is not None and np.any(dist[k, p] > r_cut):
-                raise ValueError(f"{names[k]}: atoms coupled to its downfolded adatom lie "
-                                 f"beyond r_cut = {r_cut} Ang (up to "
-                                 f"{dist[k, p].max():.2f} Ang); increase r_cut")
             sel |= set(p.tolist())
         kept.append(np.array(sorted(sel), dtype=int))
     for k in range(K):
@@ -276,3 +293,30 @@ def format_moment_report(rep: dict, labels=("i", "j")) -> str:
         parts = ", ".join(f"region {labels[k]} {v:+.3f}" for k, v in enumerate(r["regions"]))
         lines.append(f"  {name}: total {r['total']:+.3f} muB; {parts} muB")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Vertex blocks
+# ---------------------------------------------------------------------------
+def check_vertex(vertex: str) -> str:
+    if vertex not in VERTEX_MODES:
+        raise ValueError(f"vertex must be one of {VERTEX_MODES}, not {vertex!r}")
+    return vertex
+
+
+def onsite_vertex(D, atoms):
+    """Keep only the atomic on-site blocks of a vertex (TB2J-style exchange field).
+
+    D     : (n, n) vertex on n orbitals (sparse or dense)
+    atoms : (n,) atom index of every orbital
+    Returns a CSR matrix with D[a, b] = 0 whenever the orbitals a and b belong to
+    different atoms. 'full' (the default everywhere) keeps the whole region block:
+    a rigid rotation of a region rotates the inter-atomic elements of H_up - H_dn
+    too. With 'onsite', the sum over atom pairs equals TB2J's
+    J_OpenJij(I, J) = -2 sum_{a in I, b in J, R} sign(m_a m_b) J^TB2J_ab(R).
+    """
+    from scipy import sparse
+    atoms = np.asarray(atoms)
+    M = sparse.coo_matrix(D)
+    keep = atoms[M.row] == atoms[M.col]
+    return sparse.csr_matrix((M.data[keep], (M.row[keep], M.col[keep])), shape=M.shape)

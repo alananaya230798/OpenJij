@@ -29,7 +29,25 @@ The input file (a .py or .json file, or a dict) lists the DFT files:
                      "NM": ".../J_{defect_i}/n{n_dist}/{defect_j}/NM/siesta_NM.fdf"}
 
 DEVICE_FILES are templates ({defect_i}, {defect_j}, {n_dist}, {system_name});
-they are only needed for rkky_nm and liechtenstein. A DEFECT_FILES entry can also
+they are only needed for rkky_nm and liechtenstein. "AFM" (spin-polarized AFM solution
+of the same cell) is needed for liechtenstein with reference='AFM' or 'both':
+    DEVICE_FILES["AFM"] = ".../J_{defect_i}/n{n_dist}/{defect_j}/AFM/siesta_AFM.fdf"
+
+liechtenstein options (two-defect DFT files)
+    reference='FM' | 'AFM' | 'both' : spin-polarized reference of the propagators and
+        vertices. With the AFM reference the signed kernel of a Heisenberg pair is -J; the
+        sign is flipped (prefactor -> -prefactor) so that every J reported follows
+        J = (E_FM - E_AFM)/2 (J < 0 FM). 'both' runs FM and AFM and returns a
+        ReferenceRuns with J_FM, J_AFM and their mean (the mean agreed with the DFT
+        total energies within 5 % in the n_dist = 3 H-adatom tests).
+    periodic=True : LKAG on the periodic DFT cell with its k grid instead of the device
+        with pristine electrodes (Periodic_Exchange.py); time_reversal=True folds the
+        k and -k points exactly.
+Vertex blocks (all methods): vertex='full' (default, whole region block of H_up - H_dn)
+or 'onsite' (atomic on-site blocks only, the TB2J exchange field).
+Contour temperature: the temperature in the TSCCEQ file is compared with
+ElectronicTemperature of the DFT files (temperature_check='error' | 'warn' | 'off').
+TB2J on the same reduced Hamiltonians: tb2j_bridge.py. A DEFECT_FILES entry can also
 be a dict with explicit indices (defects_dependencies.load_defects), e.g.
     "2B-2": {"type": "heteroatom", "file": ".../siesta.fdf", "indices": [40, 51],
              "Z": "B", "anchor": 51}
@@ -54,6 +72,7 @@ import datetime
 import json
 import runpy
 import traceback
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
@@ -65,12 +84,13 @@ import J_dependencies as JD
 from defects_dependencies import auto_spec, load_defects
 from Device_Builder import PristineTiled, DFTDevice, canonical_method
 from Dyson_Exchange import SuperpositionDyson, calculate_exchange_dyson
+from Periodic_Exchange import PeriodicDFT, calculate_exchange_periodic
+import regions as RG
 from exchange_static_cache import build_key, cache_dir, load_build, save_build
 from exchange_mpi_io import limit_blas_threads
 
-__all__ = ["run_exchange", "ExchangeRun", "load_inputs", "load_results", "load_dos",
-           "dos_curves", "METHODS",
-           "DEFAULT_PREFACTOR"]
+__all__ = ["run_exchange", "ExchangeRun", "ReferenceRuns", "load_inputs", "load_results",
+           "load_dos", "dos_curves", "METHODS", "DEFAULT_PREFACTOR", "check_contour_temperature"]
 
 METHODS = {"rkky": "PristineTiled", "rkky_sup": "SuperpositionDyson",
            "liechtenstein_sup": "SuperpositionDyson", "rkky_nm": "DFTDevice",
@@ -136,6 +156,119 @@ def _default_results_name(method, defect_i, defect_j, n_dist, downfold, region, 
     if downfold:
         name += "_downfold"
     return name
+
+
+def electronic_temperature(fdf) -> Optional[float]:
+    """ElectronicTemperature of a SIESTA run in K, or None if the fdf does not set it."""
+    import sisl
+    try:
+        T = sisl.get_sile(str(fdf)).get("ElectronicTemperature", unit="K")
+    except Exception:
+        return None
+    return None if T is None else float(T)
+
+
+def check_contour_temperature(contour_T, files, mode: str = "error", tol: float = 1.0,
+                              say=print) -> dict:
+    """Compare the contour temperature with ElectronicTemperature of the DFT files.
+
+    The Fermi poles of the contour fix the occupations. A different temperature than the
+    SCF changes J when exchange-split levels lie within a few k_B T of E_F (H adatoms in
+    GNRs: in-gap levels 0.09-0.14 eV from E_F; 600 K instead of 50 K changes J by
+    -14 % / -41 %). mode: 'error' (raise), 'warn' or 'off'; tol in K.
+    Files without ElectronicTemperature use the SIESTA default (300 K) and only warn.
+    """
+    if mode not in ("error", "warn", "off"):
+        raise ValueError("temperature_check must be 'error', 'warn' or 'off'")
+    report = {}
+    if mode == "off" or contour_T is None:
+        return report
+    bad, unset = [], []
+    for f in files:
+        if f is None:
+            continue
+        T = electronic_temperature(f)
+        report[str(f)] = T
+        if T is None:
+            unset.append(str(f))
+        elif abs(T - float(contour_T)) > tol:
+            bad.append(f"{f}: {T:g} K")
+    if unset:
+        msg = (f"ElectronicTemperature not set in {len(unset)} DFT file(s) (SIESTA default 300 K); "
+               f"contour temperature {float(contour_T):g} K: " + ", ".join(unset))
+        warnings.warn(msg)
+    if bad:
+        msg = (f"Contour temperature {float(contour_T):g} K differs from the DFT electronic "
+               "temperature (" + "; ".join(bad) + "). Use the contour of the same SCF "
+               "temperature, or temperature_check='warn'/'off' to proceed.")
+        if mode == "error":
+            raise ValueError(msg)
+        warnings.warn(msg)
+    elif report:
+        say(f"Contour temperature {float(contour_T):g} K matches the DFT files "
+            f"({', '.join(sorted({f'{t:g} K' for t in report.values() if t is not None})) or 'unset'})")
+    return report
+
+
+def _onsite_vertices(obj, builder_name: str) -> None:
+    """Replace the vertices of a built object by their atomic on-site blocks (in place)."""
+    g = obj.H.geometry
+    if builder_name == "SuperpositionDyson":
+        if getattr(obj, "adatoms", None):
+            raise ValueError("vertex='onsite' is not available with downfolded adatoms")
+        for name in ("vertex_own", "vertex_total"):
+            Vs = getattr(obj, name)
+            setattr(obj, name, [RG.onsite_vertex(V, g.o2a(obj.R[obj.loc[k]]))
+                                for k, V in enumerate(Vs)])
+        return
+    if getattr(obj, "downfold_kwargs", None):
+        raise ValueError("vertex='onsite' is not available with downfolded adatoms")
+    for m, (Ds, os_) in list(obj.vertex_sets.items()):
+        obj.vertex_sets[m] = ([RG.onsite_vertex(D, g.o2a(o)) for D, o in zip(Ds, os_)], os_)
+    built = obj.info.get("built_method")
+    if built in obj.vertex_sets:
+        obj.Deltas, obj.orbs = obj.vertex_sets[built]
+    else:
+        obj.Deltas = [RG.onsite_vertex(D, g.o2a(o)) for D, o in zip(obj.Deltas, obj.orbs)]
+
+
+@dataclass(eq=False)
+class ReferenceRuns:
+    """run_exchange(..., reference='both'): FM- and AFM-reference LKAG of one pair.
+    Both J follow J = (E_FM - E_AFM)/2 (the AFM kernel sign is already flipped)."""
+    FM: "ExchangeRun"
+    AFM: "ExchangeRun"
+
+    @property
+    def J_FM(self) -> float:
+        return self.FM.J_meV
+
+    @property
+    def J_AFM(self) -> float:
+        return self.AFM.J_meV
+
+    @property
+    def J_mean(self) -> float:
+        return 0.5 * (self.J_FM + self.J_AFM)
+
+    @property
+    def J_meV(self) -> float:
+        return self.J_mean
+
+    @property
+    def spread(self) -> float:
+        """|J_FM - J_AFM| / 2: deviation from a rigid Heisenberg pair."""
+        return 0.5 * abs(self.J_FM - self.J_AFM)
+
+    def as_dict(self) -> dict:
+        return dict(J_FM_meV=self.J_FM, J_AFM_meV=self.J_AFM, J_mean_meV=self.J_mean,
+                    half_spread_meV=self.spread, FM_results=str(self.FM.results_dir),
+                    AFM_results=str(self.AFM.results_dir))
+
+    def summary(self) -> str:
+        return (f"liechtenstein, both references: J_FM = {self.J_FM:.6f} meV, "
+                f"J_AFM = {self.J_AFM:.6f} meV, mean = {self.J_mean:.6f} meV "
+                f"(+- {self.spread:.6f})\n  FM:  {self.FM.results_dir}\n  AFM: {self.AFM.results_dir}")
 
 
 # ===========================================================================
@@ -206,13 +339,20 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                  blas_threads="auto", dos_energies=None, dos_eta: float = 0.01,
                  dos_orbitals="region", sparsity_atol: Optional[float] = 1e-6,
                  region_assign: Optional[str] = None, region_weight: str = "delta",
-                 region_wmin: float = 1e-3, region_rcut: Optional[float] = None,
-                 mulliken_column: int = 2) -> Optional[ExchangeRun]:
+                 region_wmin: float = 1e-3, mulliken_column: int = 2,
+                 reference: str = "FM", periodic: bool = False, time_reversal: bool = True,
+                 kgrid=None, vertex: str = "full", temperature_check: str = "error",
+                 temperature_tol: float = 1.0, **removed):
     """Compute J for one defect pair with any implemented method.
 
     method          : 'rkky', 'rkky_sup', 'liechtenstein_sup' ('lkag_sup'),
                       'rkky_nm', 'liechtenstein' ('lkag')
-    basis           : host basis ('pz', 'pz1', 'pz+dz', ...)
+    basis           : orbital basis, all methods: 'pz1', 'pz', 'pz+dz', 'pz+dpi'
+                      (pz, dxz, dyz), 'pz+dpi+dz2' (pz, dxz, dyz everywhere and dz2 only
+                      on heavy atoms within 5 Ang (in-plane) of each defect anchor;
+                      'pz+dpi+dz2[R]' sets R in Ang) or 'full'. The local dz2 basis
+                      reproduces pz+dz to < 0.1 % with 19 % fewer orbitals (two-defect
+                      H-adatom tests); the electrodes carry pz, dxz, dyz only.
     n_dist          : cells between the anchors (single-defect methods) / separation
                       label of the two-defect DFT files (DFT methods)
     defect_i/j      : labels of DEFECT_FILES
@@ -226,7 +366,7 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     downfold        : fold the adatoms (rkky, rkky_sup, liechtenstein_sup only)
     region, radius  : vertex region, default 'disjoint' for every method: each atom is
                       assigned to one impurity (region_assign) and kept if its weight
-                      >= region_wmin and it lies within region_rcut of the centre.
+                      >= region_wmin (no distance cutoff: region_rcut was removed).
                       'radius' (sphere) / 'square' (xy half-side = radius, Ang) /
                       'atom_mask' are still accepted but must not overlap.
                       'all' was removed (overlapping vertices double count).
@@ -234,7 +374,10 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                       rkky_sup, liechtenstein_sup) or 'nearest' (closest centre,
                       Voronoi; the only rule of rkky_nm / liechtenstein).
     region_weight   : 'delta' (||H_up - H_dn|| per atom, eV) or 'mulliken' (|m_a|, muB).
-    region_wmin, region_rcut : weight threshold (meV or muB) and distance cutoff (Ang, None = none).
+    region_wmin     : weight threshold, eV for 'delta' (default 1e-3 = 1 meV, recommended)
+                      or muB for 'mulliken'. Fast option: region_weight='mulliken',
+                      region_wmin=1e-3 (within 1.3 % and 30-45 % fewer vertex orbitals
+                      in the two-defect tests). 1e-2 eV is not recommended.
     mulliken_column : spin column of read_charge('mulliken') in siesta.out; without an
                       output file the moments come from the density matrix.
     vertices        : liechtenstein_sup: 'own' (default) or 'region'
@@ -263,14 +406,61 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     dos_eta         : broadening of the DOS (eV).
     dos_orbitals    : device builders: 'region' (defect regions, default), None
                       (total device DOS) or device orbital indices.
+    reference       : liechtenstein: 'FM' (default), 'AFM' (DEVICE_FILES['AFM'], sign
+                      flipped so that J = (E_FM - E_AFM)/2) or 'both' (returns a
+                      ReferenceRuns with J_FM, J_AFM and J_mean; results in two folders).
+    periodic        : liechtenstein: True -> periodic DFT cell with its k grid, no
+                      electrodes (Periodic_Exchange.py); False (default) -> DFTDevice.
+    time_reversal   : periodic mode: fold k and -k exactly (default True; collinear only).
+    kgrid           : periodic mode: k points along the ribbon (int or (n, shift));
+                      None -> kgrid_Monkhorst_Pack of the DFT file.
+    vertex          : 'full' (default: whole region block of H_up - H_dn) or 'onsite'
+                      (atomic on-site blocks only, TB2J-style; not with downfolding).
+    temperature_check, temperature_tol : compare the contour temperature with the
+                      ElectronicTemperature of the DFT files: 'error' (default), 'warn'
+                      or 'off'; tolerance in K.
     sparsity_atol   : stored H/S elements with all components <= atol (eV for H) are
                       removed when ANY DFT file is read (J_dependencies.read_hamiltonian);
                       None keeps the matrices as read. Default 1e-6 (validated).
     """
+    _args = {k: v for k, v in locals().items() if k not in ("removed",)}
+    if "region_rcut" in removed:
+        raise TypeError("region_rcut was removed: regions have no distance cutoff (J follows "
+                        "the Delta tail and is not converged until the whole cell is "
+                        "included). Use region_wmin (1e-3 eV) or region_weight='mulliken'.")
+    if removed:
+        raise TypeError(f"run_exchange() got unexpected arguments {sorted(removed)}")
+    JD.parse_basis(basis)                     # validates basis names early
     method = canonical_method(method)
     if method not in METHODS:
         raise ValueError(f"Unknown method '{method}'. Use one of {tuple(METHODS)}")
-    builder_name = METHODS[method]
+    reference = str(reference).upper() if str(reference).lower() != "both" else "both"
+    if reference not in ("FM", "AFM", "both"):
+        raise ValueError("reference must be 'FM', 'AFM' or 'both'")
+    if method != "liechtenstein" and reference != "FM":
+        raise ValueError("reference='AFM'/'both' is available for liechtenstein (two-defect DFT files)")
+    if periodic and method != "liechtenstein":
+        raise ValueError("periodic=True is available for liechtenstein only")
+    vertex = RG.check_vertex(vertex)
+    if vertex == "onsite" and downfold:
+        raise ValueError("vertex='onsite' is not available with downfolded adatoms")
+    if reference == "both":
+        runs = {}
+        for ref in ("FM", "AFM"):
+            kw = dict(_args, reference=ref)
+            if results_name is not None:
+                kw["results_name"] = f"{results_name}_{ref}"
+            runs[ref] = run_exchange(**kw)
+        if comm is not None and comm.Get_rank() != 0:
+            return None
+        both = ReferenceRuns(runs["FM"], runs["AFM"])
+        if write_results:
+            f = both.FM.results_dir.parent / (both.FM.results_dir.name.removesuffix("_FM") + "_references.json")
+            f.write_text(json.dumps(both.as_dict(), indent=2))
+        if verbose:
+            print(both.summary())
+        return both
+    builder_name = "PeriodicDFT" if periodic else METHODS[method]
     if downfold and builder_name == "DFTDevice":
         raise ValueError(f"{method} keeps the adatoms explicit in the DFT device: "
                          "downfold must be False")
@@ -279,6 +469,9 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     say = print if (verbose and rank == 0) else (lambda *a, **k: None)
     region = _DEFAULT_REGION[method] if region is None else region
     prefactor = DEFAULT_PREFACTOR[method] if prefactor is None else float(prefactor)
+    # AFM reference: the signed kernel of a Heisenberg pair is -J -> flip the sign so that
+    # J = (E_FM - E_AFM)/2 also from the AFM reference.
+    prefactor_eff = -prefactor if reference == "AFM" else prefactor
     if vertex_source is None and method == "rkky_nm":
         vertex_source = "fm"
 
@@ -294,22 +487,26 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
         if "PRISTINE_FILE" not in data:
             raise ValueError("The input file must define PRISTINE_FILE (pristine electrode)")
         folder_ = Path(folder) if folder is not None else Path(f"H_{system_name}_{basis}_{method}")
-        name_ = results_name or _default_results_name(
+        name_ = results_name or (_default_results_name(
             method, defect_i, defect_j, n_dist, downfold, region, radius, vertices, vertex_source)
+            + ("_periodic" if periodic else "") + ("_AFMref" if reference == "AFM" else "")
+            + ("_onsite" if vertex == "onsite" else ""))
 
         files = data["DEFECT_FILES"]
-        needs_single = builder_name != "DFTDevice" or vertex_source == "single"
+        needs_single = builder_name not in ("DFTDevice", "PeriodicDFT") or vertex_source == "single"
         for label in ((defect_i, defect_j) if needs_single else ()):
             if label not in files:
                 raise KeyError(f"'{label}' not in DEFECT_FILES ({list(files)})")
         fm = nm = None
-        if builder_name == "DFTDevice":
+        if builder_name in ("DFTDevice", "PeriodicDFT"):
             templates = data.get("DEVICE_FILES", {})
             fill = dict(defect_i=defect_i, defect_j=defect_j, n_dist=n_dist, system_name=system_name)
-            fm = templates.get("FM", "").format(**fill) or None
+            sp_key = "AFM" if reference == "AFM" else "FM"
+            fm = templates.get(sp_key, "").format(**fill) or None
             nm = templates.get("NM", "").format(**fill) or None
             if method == "liechtenstein" and fm is None:
-                raise ValueError("liechtenstein needs DEVICE_FILES['FM'] in the input file")
+                raise ValueError(f"liechtenstein with reference='{reference}' needs "
+                                 f"DEVICE_FILES['{sp_key}'] in the input file")
             if method == "rkky_nm" and nm is None:
                 raise ValueError("rkky_nm needs DEVICE_FILES['NM'] in the input file")
             if method == "rkky_nm" and vertex_source == "fm" and fm is None:
@@ -324,6 +521,9 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
             input_files += [e["file"] if isinstance(e, dict) else e
                             for e in (entry(defect_i), entry(defect_j))]
         input_files += [f for f in (fm, nm) if f]
+        # contour temperature against the SCF temperature of the files used
+        check_contour_temperature(contour["T"], input_files, mode=temperature_check,
+                                  tol=temperature_tol, say=say)
         settings = dict(builder=builder_name, method=method, basis=basis, align=align,
                         n_dist=n_dist, defect_i=defect_i, defect_j=defect_j,
                         defect_type=defect_type, adatom_species=adatom_species, Z=Z,
@@ -331,12 +531,22 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                         vertex_source=vertex_source, N_imp=N_imp, N_buffer=N_buffer,
                         sparsity_atol=sparsity_atol, region_assign=region_assign,
                         region_weight=region_weight, region_wmin=region_wmin,
-                        region_rcut=region_rcut, mulliken_column=mulliken_column,
+                        mulliken_column=mulliken_column, reference=reference,
+                        periodic=bool(periodic), kgrid=repr(kgrid),
                         builder_kwargs=sorted((k, repr(v)) for k, v in (builder_kwargs or {}).items()),
                         defect_entries=[entry(k) for k in ((defect_i, defect_j) if needs_single else ())])
         key = build_key(settings, input_files) if cache_static else None
         common = dict(data=data, system_name=system_name, contour=contour,
                       folder=str(folder_), results_name=name_)
+        if builder_name == "PeriodicDFT":       # cheap to build: no cache
+            builder = PeriodicDFT(fm, basis=basis, defect_type=defect_type, species=adatom_species,
+                                  Z=Z, region=region, weight=region_weight, w_min=region_wmin,
+                                  mulliken_column=mulliken_column, kgrid=kgrid, vertex=vertex,
+                                  verbose=verbose)
+            obj = builder.build(method)
+            H_0 = None
+            return dict(common, obj=obj, H_0=H_0, eshift=None, specs=(), builder=builder,
+                        from_cache=False)
         if cache_static and not force_rebuild:
             cached = load_build(cache_dir(folder_, name_), key, verbose=verbose)
             if cached is not None:
@@ -360,8 +570,7 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
         # 4. builder and build
         extra = dict(builder_kwargs or {})
         extra.setdefault("verbose", verbose)
-        extra.update(weight=region_weight, w_min=region_wmin, r_cut=region_rcut,
-                     mulliken_column=mulliken_column)
+        extra.update(weight=region_weight, w_min=region_wmin, mulliken_column=mulliken_column)
         if builder_name == "DFTDevice":
             if region_assign not in (None, "nearest"):
                 raise ValueError("The two-defect DFT devices only support region_assign='nearest'")
@@ -407,6 +616,8 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     else:
         prep = prepare()
     obj = prep["obj"]
+    if vertex == "onsite" and builder_name != "PeriodicDFT":      # periodic: done in the builder
+        _onsite_vertices(obj, builder_name)
     data, contour, H_0 = prep["data"], prep["contour"], prep["H_0"]
     folder, results_name = Path(prep["folder"]), prep["results_name"]
     results_dir = folder / results_name
@@ -420,10 +631,21 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
     # 5. exchange (contour energies shared by all ranks)
     say(f"Computing {method} with {builder_name} on {comm.Get_size() if parallel else 1} rank(s) ...")
     # calculate_exchange writes the results itself when it caches self-energies or runs with MPI
-    cached = builder_name != "SuperpositionDyson" and (self_energy_mode != "compute" or parallel)
-    if builder_name == "SuperpositionDyson":
+    cached = (builder_name not in ("SuperpositionDyson", "PeriodicDFT")
+              and (self_energy_mode != "compute" or parallel))
+    if reference == "AFM":
+        say("AFM reference: prefactor sign flipped, J = (E_FM - E_AFM)/2 for a Heisenberg pair")
+    if builder_name == "PeriodicDFT":
+        if dos_energies is not None:
+            raise ValueError("dos_energies is not available with periodic=True")
+        result = calculate_exchange_periodic(
+            obj, contour["En"], contour["weights"], prefactor=prefactor_eff,
+            time_reversal=time_reversal, orbital_resolved=orbital_resolved,
+            orbital_kernel="none" if orbital_kernel == "none" else "classes",
+            comm=comm if parallel else None, verbose=verbose)
+    elif builder_name == "SuperpositionDyson":
         result = calculate_exchange_dyson(
-            obj, method, contour["En"], contour["weights"], prefactor=prefactor,
+            obj, method, contour["En"], contour["weights"], prefactor=prefactor_eff,
             lead_eta=lead_eta, vertex_downfold=vertex_downfold, vertices=vertices,
             orbital_resolved=orbital_resolved, verbose=verbose,
             comm=comm if parallel else None, solver=solver, orbital_kernel=orbital_kernel,
@@ -431,7 +653,7 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
             calculation_folder=folder if self_energy_mode != "compute" else None)
     else:
         result = JD.calculate_exchange(
-            **obj.exchange_kwargs(method), prefactor=prefactor, energies=contour["En"],
+            **obj.exchange_kwargs(method), prefactor=prefactor_eff, energies=contour["En"],
             contour_weights=contour["weights"], nk=nk, lead_eta=lead_eta,
             orbital_resolved=orbital_resolved, orbital_kernel=orbital_kernel, verbose=False,
             self_energy_mode=self_energy_mode,
@@ -453,13 +675,17 @@ def run_exchange(method: str, basis: str = "pz", n_dist: int = 2,
                   defect_i=defect_i, defect_j=defect_j, defect_type=defect_type,
                   adatom_species=adatom_species, Z=Z, downfold=downfold, region=region,
                   radius=radius, vertices=vertices, vertex_source=vertex_source,
-                  vertex_downfold=vertex_downfold, prefactor=prefactor, align=align,
+                  vertex_downfold=vertex_downfold, prefactor=prefactor_eff, align=align,
+                  reference=reference, periodic=bool(periodic),
+                  time_reversal=bool(time_reversal) if periodic else None,
+                  kgrid=list(obj.kgrid) if periodic else None, vertex=vertex,
+                  temperature_check=temperature_check, contour_T=contour.get("T"),
                   N_imp=N_imp, N_buffer=N_buffer, nk=list(nk), lead_eta=lead_eta,
                   self_energy_mode=self_energy_mode, cache_static=bool(cache_static),
                   build_from_cache=bool(prep.get("from_cache", False)), solver=solver,
                   orbital_kernel=orbital_kernel, contour=contour["source"],
                   sparsity_atol=sparsity_atol, region_assign=region_assign,
-                  region_weight=region_weight, region_wmin=region_wmin, region_rcut=region_rcut,
+                  region_weight=region_weight, region_wmin=region_wmin,
                   mpi_ranks=comm.Get_size() if parallel else 1,
                   pristine_file=str(data["PRISTINE_FILE"]),
                   defect_files={k: (files[k] if isinstance(files[k], dict) else str(files[k]))

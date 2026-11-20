@@ -161,7 +161,166 @@ def get_Delta_orbital_atoms(
             values[ia] = np.sum(diag_host[global_orbs[local_idx]])
     return values
 
-def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_basis="s"):
+
+# ---------------------------------------------------------------------------
+# Orbital bases
+# ---------------------------------------------------------------------------
+# 'pz1'          first-zeta pz on every heavy atom
+# 'pz'           all pz
+# 'pz+dz'        pz + dxz + dyz + dz2
+# 'pz+dpi'       pz + dxz + dyz (the pi-like d orbitals)
+# 'pz+dpi+dz2'   pz + dxz + dyz everywhere, dz2 only on heavy atoms within DZ2_RADIUS (xy)
+#                of a defect anchor; 'pz+dpi+dz2[R]' sets the radius R (Ang).
+#                In a flat sp2 host dz2 is decoupled from pz/dxz/dyz by mirror symmetry,
+#                so it is only needed where the adatom puckers the lattice. Two-defect
+#                H-adatom tests (n_dist=3): R = 5-8 Ang reproduces pz+dz to < 0.1 %
+#                (FM and AFM references) with 19 % fewer orbitals; dz2 on the anchor
+#                alone is 22 % off for H0-H1.
+# 'full'         every atom and orbital
+BASES = ("pz1", "pz", "pz+dz", "pz+dpi", "pz+dpi+dz2", "full")
+DZ2_RADIUS = 5.0          # Ang; between the 4.92 and 5.11 Ang neighbour shells of graphene
+_LOCAL_RE = re.compile(r"pz\+dpi\+dz2(?:\[([0-9]*\.?[0-9]+)\])?")
+
+
+def parse_basis(basis):
+    """(name, radius) of a basis string; radius is None except for 'pz+dpi+dz2'."""
+    b = str(basis).lower().replace(" ", "")
+    m = _LOCAL_RE.fullmatch(b)
+    if m:
+        return "pz+dpi+dz2", (float(m.group(1)) if m.group(1) else DZ2_RADIUS)
+    if b == "all":
+        b = "full"
+    if b not in BASES:
+        raise ValueError(f"Invalid basis '{basis}'. Use one of {BASES} or 'pz+dpi+dz2[R]'")
+    return b, None
+
+
+def is_local_basis(basis) -> bool:
+    """True for 'pz+dpi+dz2' / 'pz+dpi+dz2[R]' (dz2 only near the defect anchors)."""
+    return parse_basis(basis)[0] == "pz+dpi+dz2"
+
+
+def host_basis(basis) -> str:
+    """Basis to prune the pristine cell with: the local basis needs dz2 everywhere in the
+    host ('pz+dz'); the builders remove it away from the anchors and in the electrodes."""
+    return "pz+dz" if is_local_basis(basis) else parse_basis(basis)[0]
+
+
+def find_dz2_centres(H, z_thresh: float = 0.3, bond: float = 1.6):
+    """Automatic centres of the local dz2 set (atom indices of H): the heavy atom bonded to
+    every out-of-plane adatom (H, ...) and every heavy atom that is not carbon."""
+    g = H.geometry if hasattr(H, "geometry") else H
+    Z = np.asarray(g.atoms.Z)
+    heavy = np.flatnonzero(np.isin(Z, (5, 6, 7, 8, 9)))
+    if heavy.size == 0:
+        return []
+    zp = np.median(g.xyz[heavy, 2])
+    cen = set(int(a) for a in heavy if Z[a] != 6)
+    for a in np.flatnonzero(~np.isin(Z, (5, 6, 7, 8, 9))):
+        if abs(g.xyz[a, 2] - zp) <= z_thresh:
+            continue                                    # in-plane (edge passivation)
+        d = np.linalg.norm(g.xyz[heavy] - g.xyz[a], axis=1)
+        if d.min() <= bond:
+            cen.add(int(heavy[np.argmin(d)]))
+    return sorted(cen)
+
+
+def local_dz2_atoms(H, radius: float = DZ2_RADIUS, centres=None):
+    """Heavy atoms of H (indices of H) within `radius` (in-plane xy distance, Ang) of a centre.
+    centres: atom indices of H; None -> find_dz2_centres(H)."""
+    g = H.geometry if hasattr(H, "geometry") else H
+    centres = find_dz2_centres(g) if centres is None else [int(c) for c in np.atleast_1d(centres)]
+    if len(centres) == 0:
+        return set()
+    heavy = np.isin(np.asarray(g.atoms.Z), (5, 6, 7, 8, 9))
+    d = np.linalg.norm(g.xyz[:, None, :2] - g.xyz[centres][None, :, :2], axis=2).min(axis=1)
+    return set(np.flatnonzero(heavy & (d <= radius + 1e-6)).tolist())
+
+
+def _is_dz2(orb):
+    return orb.l == 2 and orb.m == 0
+
+
+def _heavy(g):
+    return np.flatnonzero(np.isin(np.asarray(g.atoms.Z), (5, 6, 7, 8, 9)))
+
+
+def map_atoms_xy(geom_from, anchor_from, geom_to, anchor_to, atoms, tol=0.1):
+    """Map atoms of geom_from onto geom_to by the in-plane translation anchor_from ->
+    anchor_to (same rule as the defect -> host mapping). Returns {atom_from: atom_to} for
+    the atoms found within tol (Ang)."""
+    atoms = np.asarray(sorted(int(a) for a in atoms), dtype=int)
+    if atoms.size == 0:
+        return {}
+    shift = geom_to.xyz[anchor_to, :2] - geom_from.xyz[anchor_from, :2]
+    d, idx = cKDTree(geom_to.xyz[:, :2]).query(geom_from.xyz[atoms, :2] + shift)
+    out = {int(a): int(i) for a, dd, i in zip(atoms, d, idx) if dd <= tol}
+    if int(anchor_from) in set(atoms.tolist()):
+        out[int(anchor_from)] = int(anchor_to)       # the anchors define the translation
+    return out
+
+
+def dz2_atoms_from_host(geom_def, def_anchor, host, host_anchor, tol=0.1):
+    """ORIGINAL heavy atoms of a defect file that land (map_atoms_xy) on host atoms carrying
+    dz2. With the local dz2 basis this makes the defect file and the host (device) agree
+    atom by atom, whatever small relaxation the defect file has near the radius."""
+    gh = host.geometry if hasattr(host, "geometry") else host
+    host_dz2 = {int(ia) for ia in _heavy(gh) if any(_is_dz2(o) for o in gh.atoms[ia].orbitals)}
+    if not host_dz2:
+        return set()
+    m = map_atoms_xy(geom_def, def_anchor, gh, host_anchor, _heavy(geom_def), tol)
+    return {a for a, h in m.items() if h in host_dz2}
+
+
+def trim_dz2(H, keep_atoms=()):
+    """Remove the dz2 orbitals of every heavy atom of H except keep_atoms (indices of H).
+    Used for the local dz2 basis: host cells (dz2 kept near the device anchors) and
+    electrodes (no dz2). Other orbitals and non-heavy atoms are untouched."""
+    keep_atoms = set(int(a) for a in keep_atoms)
+    heavy = np.isin(np.asarray(H.atoms.Z), (5, 6, 7, 8, 9))
+    groups = defaultdict(list)
+    removed = 0
+    for ia in range(H.na):
+        orbs = H.atoms[ia].orbitals
+        if heavy[ia] and ia not in keep_atoms:
+            sel = tuple(io for io, o in enumerate(orbs) if not _is_dz2(o))
+        else:
+            sel = tuple(range(len(orbs)))
+        removed += len(orbs) - len(sel)
+        groups[sel].append(ia)
+    if removed == 0:
+        return H.copy()
+    H_new = H.copy()
+    for sel, atoms in groups.items():
+        if len(sel) != H.atoms[atoms[0]].no:
+            H_new = H_new.sub_orbital(atoms=atoms, orbitals=list(sel))
+    H_new.reduce()
+    return H_new
+
+
+def has_dz2(H) -> bool:
+    """True if every heavy atom of H carries a dz2 orbital."""
+    heavy = np.flatnonzero(np.isin(np.asarray(H.atoms.Z), (5, 6, 7, 8, 9)))
+    return all(any(_is_dz2(o) for o in H.atoms[ia].orbitals) for ia in heavy)
+
+
+def _basis_orbitals(atom, name, local):
+    """Indices of the orbitals of one heavy atom kept by basis `name` (local: has dz2)."""
+    pz = [io for io, o in enumerate(atom.orbitals) if o.l == 1 and o.m == 0]
+    dpi = [io for io, o in enumerate(atom.orbitals) if o.l == 2 and o.m in (-1, 1)]
+    dz2 = [io for io, o in enumerate(atom.orbitals) if _is_dz2(o)]
+    if name == "pz":
+        return pz
+    if name == "pz+dz":
+        return sorted(pz + dpi + dz2)
+    if name == "pz+dpi":
+        return sorted(pz + dpi)
+    if name == "pz+dpi+dz2":
+        return sorted(pz + dpi + (dz2 if local else []))
+    raise ValueError(name)
+
+def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_basis="s",
+                       dz2_centres=None, dz2_atoms=None):
     """
     Prepare a spin-polarized Hamiltonian with the same basis convention as prune_ham.
 
@@ -170,7 +329,7 @@ def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_b
     H : sisl.Hamiltonian
         Spin-polarized Hamiltonian from SIESTA/TranSiesta.
     basis : str
-        'pz1', 'pz', 'pz+dz', or 'full'.
+        'pz1', 'pz', 'pz+dz', 'pz+dpi', 'pz+dpi+dz2' (or 'pz+dpi+dz2[R]'), or 'full'.
     remove_atoms : sequence of int
         Original atom indices to remove (e.g., H atoms for RKKY/downfolding).
     keep_orbitals : sequence of int or dict
@@ -178,6 +337,14 @@ def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_b
         an orbital label ('s', 'p', 'pz', 's+pz', 'all'); a sequence uses extra_basis.
     extra_basis : str
         Orbital label for extra atoms supplied as a sequence.
+    dz2_centres : sequence of int, optional
+        'pz+dpi+dz2' only: ORIGINAL atom indices around which dz2 is kept (the defect
+        anchors). None -> find_dz2_centres(H) (heavy atom under each out-of-plane
+        adatom, and non-carbon heavy atoms). The builders pass the spec anchors.
+    dz2_atoms : sequence of int, optional
+        'pz+dpi+dz2' only: explicit ORIGINAL atom indices carrying dz2 (overrides
+        dz2_centres). The builders use it to match a defect file to its host
+        (dz2_atoms_from_host).
 
     Returns
     -------
@@ -185,10 +352,13 @@ def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_b
     original_indices : ndarray
         Original atom index for each atom in H_new (in the same order).
     """
-    basis = basis.lower().replace(" ", "")
-    valid = ("pz1", "pz", "pz+dz", "full")
-    if basis not in valid:
-        raise ValueError(f"Invalid basis: {basis}")
+    basis, dz2_radius = parse_basis(basis)
+    if basis != "pz+dpi+dz2":
+        local_dz2 = set()
+    elif dz2_atoms is not None:
+        local_dz2 = set(int(a) for a in dz2_atoms)
+    else:
+        local_dz2 = local_dz2_atoms(H, dz2_radius, dz2_centres)
 
     # Original atoms to remove, including adatoms explicitly downfolded elsewhere.
     removed = np.asarray(list(remove_atoms), dtype=int)
@@ -256,8 +426,6 @@ def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_b
         original_ia = int(original_indices[ia])
         pz = [io for io, orb in enumerate(atom.orbitals)
               if orb.l == 1 and orb.m == 0]
-        dz = [io for io, orb in enumerate(atom.orbitals) # dz2 important for adatoms
-              if orb.l == 2 and orb.m in (-1,0, 1)]
 
         # NEW: select orbitals on explicitly retained adatoms by label.
         if original_ia in extra:
@@ -276,10 +444,8 @@ def prepare_spin_basis(H, basis="pz", remove_atoms=(), keep_orbitals=(), extra_b
                 atom.orbitals[io], "zeta", getattr(atom.orbitals[io], "Z", 1)
             ) == 1]
             selected = first[:1]
-        elif basis == "pz":
-            selected = pz
-        elif basis == "pz+dz":
-            selected = sorted(pz + dz)
+        else:
+            selected = _basis_orbitals(atom, basis, original_ia in local_dz2)
 
         if not selected:
             raise ValueError(f"No matching orbitals on original atom {original_ia}")
@@ -400,6 +566,7 @@ def extract_single_Delta(
     extra_basis="s",         # NEW: orbital label for listed adatoms
     radius=3.5,             # Angstrom; radius or square half-side
     atom_mask=None,         # NEW: original SP atom indices for region='atom_mask'
+    dz2_atoms=None,         # local dz2 basis: ORIGINAL atoms with dz2 (None: from the host)
 ):
     """
     Extract Delta = H_up - H_down and map it to host orbitals.
@@ -425,9 +592,12 @@ def extract_single_Delta(
         raise ValueError("A collinear spin-polarized Hamiltonian is required")
 
     # 2. Apply basis selection (NEW: optionally retain adatom orbitals)
+    if is_local_basis(basis) and dz2_atoms is None:
+        # dz2 exactly on the atoms that land on host atoms carrying dz2
+        dz2_atoms = dz2_atoms_from_host(H_sp.geometry, defect_anchor, H_host, host_anchor, tol)
     H_def, original_atoms = prepare_spin_basis(
         H_sp, basis=basis, remove_atoms=adatom_atoms,
-        keep_orbitals=keep_orbitals, extra_basis=extra_basis,
+        keep_orbitals=keep_orbitals, extra_basis=extra_basis, dz2_atoms=dz2_atoms,
     )
     positions = np.flatnonzero(original_atoms == defect_anchor)
     if len(positions) != 1:
@@ -632,6 +802,10 @@ def prune_ham(
         'pz1'    : first pz orbital (zeta=1)
         'pz'     : all pz orbitals
         'pz+dz'  : all pz, dxz, dyz, dz2 orbitals
+        'pz+dpi' : all pz, dxz, dyz orbitals
+        'pz+dpi+dz2' / 'pz+dpi+dz2[R]' : the pristine cell has no anchor; it is returned
+                   WITH dz2 on every atom (as 'pz+dz'): the builders keep dz2 only within
+                   R of the device anchors and remove it from the electrodes (trim_dz2).
         'full'   : retain all atoms and orbitals
 
     align : str
@@ -668,12 +842,10 @@ def prune_ham(
 
     # 1. Read Hamiltonian
     H_0_DFT = read_hamiltonian(H_PRISTINE_FILE)
-    basis = basis.lower().replace(" ", "")
+    basis_in = basis
+    basis = host_basis(basis)            # local dz2 basis -> pz+dz host (trimmed by the builders)
     align = align.lower()
-    valid_basis = ("pz1", "pz", "pz+dz", "full")
     valid_align = ("none", "manual", "vb", "cb")
-    if basis not in valid_basis:
-        raise ValueError(f"basis must be one of {valid_basis}")
     if align not in valid_align:
         raise ValueError(f"align must be one of {valid_align}")
     # 2. Select atoms and orbitals
@@ -729,7 +901,6 @@ def prune_ham(
             pz_idx = [io for io, orb in enumerate(atom.orbitals)if orb.l == 1 and orb.m == 0]
             # dz : dxz, dyz, dz2
             # l=2, m=-1, 0, +1
-            dz_idx = [io for io, orb in enumerate(atom.orbitals)if orb.l == 2 and orb.m in (-1,0, 1)] # dz2 important for adatoms
             # Additional atoms use their own orbital selection
             if original_ia in extra_selection:
                 label = extra_selection[original_ia]
@@ -756,10 +927,8 @@ def prune_ham(
                 # Prefer the non-polarization orbital
                 first_pz.sort( key=lambda io: bool(getattr(atom.orbitals[io], "P", False)))
                 selected = [first_pz[0]]
-            elif basis == "pz":
-                selected = pz_idx
-            elif basis == "pz+dz":
-                selected = sorted(pz_idx + dz_idx)
+            else:
+                selected = _basis_orbitals(atom, basis, True)
             if not selected:
                 raise ValueError(f"No matching orbitals for atom {original_ia} Z={atom.Z}")
             orbital_groups[tuple(selected)].append(ia)
@@ -793,7 +962,7 @@ def prune_ham(
 
     # 4. Report
     if verbose:
-        print(f"\nBasis selection: {basis}")
+        print(f"\nBasis selection: {basis}" + (f" (host of '{basis_in}')" if basis != str(basis_in).lower().replace(" ", "") else ""))
         print(f"Alignment: {align}")
         print(f"Energy shift: {eshift:.6f} eV")
         # Show additional atom selections
@@ -1702,19 +1871,25 @@ def get_R0_block(H, dim):
     M = H.tocsr(dim=dim)
     return M[:, isc0 * no:(isc0 + 1) * no].tocsr()
 
-def select_retained_orbitals(H, H_idx, basis="pz"):
+def select_retained_orbitals(H, H_idx, basis="pz", dz2_centres=None, dz2_atoms=None):
     """
     Select retained orbitals in the ORIGINAL full DFT indexing.
     pz1  : first-zeta pz
     pz   : all pz
     pz+dz: all pz + d orbitals with m=-1,0,1
+    pz+dpi: all pz + dxz + dyz
+    pz+dpi+dz2[R]: pz + dxz + dyz, dz2 within R of the anchors (dz2_centres; None ->
+           find_dz2_centres(H), which contains the heavy atom bonded to H_idx)
     all  : all orbitals except those of H_idx
     """
-    basis = basis.lower()
-    if basis == "full":
-        basis = "all"
-    if basis not in ("pz1", "pz", "pz+dz", "all"):
-        raise ValueError(f"Unknown basis: {basis}")
+    name, radius = parse_basis(basis)
+    basis = "all" if name == "full" else name
+    if name != "pz+dpi+dz2":
+        local = set()
+    elif dz2_atoms is not None:
+        local = set(int(a) for a in dz2_atoms)
+    else:
+        local = local_dz2_atoms(H, radius, dz2_centres)
     g = H.geometry
     retained_orbs = []
 
@@ -1728,7 +1903,8 @@ def select_retained_orbitals(H, H_idx, basis="pz"):
         for io, orb in zip(atom_orbs, atom.orbitals):
 
             pz = (orb.l == 1 and orb.m == 0)
-            dz = (orb.l == 2 and orb.m in (-1,0, 1)) # dz2 important for adatoms
+            dpi = (orb.l == 2 and orb.m in (-1, 1))
+            dz2 = _is_dz2(orb)
 
             if basis == "all":
                 keep = True
@@ -1736,15 +1912,19 @@ def select_retained_orbitals(H, H_idx, basis="pz"):
                 keep = pz and orb.zeta == 1
             elif basis == "pz":
                 keep = pz
-            else:
-                keep = pz or dz
+            elif basis == "pz+dz":
+                keep = pz or dpi or dz2
+            elif basis == "pz+dpi":
+                keep = pz or dpi
+            else:                                   # pz+dpi+dz2
+                keep = pz or dpi or (dz2 and ia in local)
 
             if keep:
                 retained_orbs.append(int(io))
 
     return np.asarray(retained_orbs, dtype=int)
 
-def prepare_hydrogen_downfold(H, H_idx, Z=1, basis="pz"):
+def prepare_hydrogen_downfold(H, H_idx, Z=1, basis="pz", dz2_atoms=None):
     """
     Prepare local H-downfolding matrices.
     
@@ -1762,7 +1942,7 @@ def prepare_hydrogen_downfold(H, H_idx, Z=1, basis="pz"):
     if H.geometry.atoms[H_idx].Z != Z:
         raise ValueError(F"idx must identify Z={Z}.")
     h = np.asarray(H.geometry.a2o(H_idx, all=True), dtype=int)
-    orb_all = select_retained_orbitals(H, H_idx, basis)
+    orb_all = select_retained_orbitals(H, H_idx, basis, dz2_atoms=dz2_atoms)
 
     # R=0 Hamiltonian and overlap
     Hu = get_R0_block(H, 0) #up
